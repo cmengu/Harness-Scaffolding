@@ -1,0 +1,8 @@
+# Vendored study copy of Databricks omnigent — referenced, never shipped.
+# Upstream URL + commit are recorded in NOTICE; line refs in code comments
+# (e.g. "LIFT :2347") point into that snapshot.
+reference/omnigent/
+
+__pycache__/
+*.pyc
+.DS_Store

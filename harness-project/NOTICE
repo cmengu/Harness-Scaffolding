@@ -1,0 +1,17 @@
+council
+Copyright (c) 2026 Ng Chen Meng
+
+This project contains code adapted from omnigent,
+Copyright (2026) Databricks, Inc., licensed under the Apache License,
+Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+Adapted portions live primarily in:
+  - council/policy.py            (pattern/constant sets, lifted verbatim)
+  - council/wrap/bridge.py       (tmux inject + camera helpers, near-verbatim)
+  - council/wrap/state.py        (statusLine capture, near-whole)
+  - council/wrap/tui_contract.py (TUI layout constants)
+
+The full omnigent source is NOT distributed with this repository. A local
+study snapshot is kept (gitignored) under reference/omnigent/; code comments
+of the form "LIFT :NNNN" are line references into that snapshot.
+Upstream: https://github.com/omnigent-ai/omnigent

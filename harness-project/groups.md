@@ -20,7 +20,7 @@ Line numbers track that vendored snapshot. (G1's are a few lines stale — corre
 | **G3 — WRAP** | run the REAL claude hidden, render it in council's skin | `wrap/{session,bridge,events,render,state,harness_status}.py` | **done — mapped in full below** |
 | **G4 — PERSISTENCE** | the scaling seam | `ledger.py` (record/trace) | done (shown in G1) |
 | **G5 — POLICY** | blast_radius ALLOW/DENY/ASK | `policy.py` | **done — mapped below** |
-| **G6 — HARNESS BRIDGE** | the the-harness hand-off | `launch.py` · `scripts/call-reviewer.sh` | pending |
+| **G6 — HARNESS BRIDGE** | the the-harness hand-off | `launch.py` · `scripts/call-reviewer.sh` | **cut from v1** — kept as future work |
 
 ---
 
@@ -31,15 +31,15 @@ below belong to *one* engine each — they are **not** all used at once:
 
 | command | what it's for | files it uses |
 |---|---|---|
-| **`council ask`** | adversarial debate — bounce ideas across Claude vs Codex | `cli.py` · `chat.py` (`run_loop`) · `debate.py` · `backends.py` |
+| **`council ask`** | chat with Claude; `/duel` summons the Codex adversary per-question | `cli.py` · `chat.py` (`run_loop`) · `debate.py` · `backends.py` |
 | **`council code`** | write code via the REAL Claude Code, hidden, with the-harness live | `cli.py` · `wrap/{session,bridge,events,render,state,harness_status}.py` |
-| **`council review`** | cross-family code review | `cli.py` · `scripts/call-reviewer.sh` (G6) |
+| ~~`council review`~~ | **CUT from v1** (3 Jul 2026) — cross-family review stays a G6 future-work section | — |
 
 ```
-   council ask    ──► debate.run         (G2: chat.py loop + debate.py + backends.py)   🟠 vs 🔵
+   council ask    ──► run_loop(DebateRenderer)   (G2)  /duel OFF → 🟠 solo · /duel ON → 🟠 vs 🔵
    council code   ──► run_claude_session  (G3: wrap/*  — hides a real Claude Code)
-   council review ──► call-reviewer        (G6: codex)
-          └──────────────── all three → record() → ledger.jsonl (G4) ────────────┘
+   council review ──► (cut from v1 — G6 future work)
+          └──────────────── both modes → record() → ledger.jsonl (G4) ────────────┘
 ```
 
 > So `chat.py` / `debate.py` / `backends.py` appear **only** in `ask`; `wrap/*` appears **only** in
@@ -76,7 +76,10 @@ class Config:
     claude_command: str = "claude"   # the REAL binary CODE wraps
     codex_command: str = "codex"
     rounds: int = 1                  # debate default               ↔ Debby SKILL.md:14-18
-    head_timeout: int = 120          # per-head subprocess timeout, seconds   ↔ G2 backends._run
+    head_timeout: int = 300          # per-head subprocess timeout, s (120 starved codex/extended thinking)
+    turn_timeout: int = 600          # H1: max wait for a code-mode turn before the stall check
+    submit_timeout: int = 10         # H2: max wait to confirm an inject submitted before failing loud
+    history_turns: int = 6           # ask-mode memory: past turns carried in the ledger preamble
     judge_style: str | None = None   # interactive-loop judge STYLE: None | 'moderator' | 'reasoning'
     heads: Heads = field(default_factory=Heads)
 
@@ -113,11 +116,10 @@ def render_banner(console: Console, cfg: Config, mode: str) -> None:
     """Paint council's skin once, at launch. Same skin for all 3 modes — only the subtitle
     changes — so the user never sees a different UI when CODE swaps in the hidden Claude Code."""
     subtitle = {
-        "ask":    f"think · {cfg.heads.proposer} vs {cfg.heads.adversary}"
+        "ask":    f"think · {cfg.heads.proposer} · /duel summons {cfg.heads.adversary}"
                   + (f" · judge:{cfg.heads.judge}" if cfg.heads.judge else ""),
         "code":   "code · Claude Code + the-harness  (hidden engine)",
-        "review": f"review · {cfg.heads.adversary}",
-    }[mode]
+    }[mode]   # ("review" cut from v1 — G6)
     body = Text.assemble(
         (subtitle + "\n", "cyan"),
         (f"cwd  {_display_cwd()}\n", "dim"),
@@ -147,22 +149,30 @@ two bodies (local jsonl → shared server) and the rest of the codebase doesn't 
 """council/ledger.py — the ONE persistence seam (write + read).
 ↔ replaces omnigent stores/conversation_store + repl/_session_log.py (572 lines → ~30)."""
 from __future__ import annotations
-import json, time
+import json, threading, time
+from functools import lru_cache
 from .config import load_config
+
+_LOCK = threading.Lock()   # record() has concurrent callers: code-mode pumps + ask-mode failure path
+
+@lru_cache(maxsize=1)
+def _cfg():
+    """Config once per process, NOT once per event — code mode records per token chunk."""
+    return load_config()
 
 def record(event: dict) -> None:
     """The only writer. Append one event. (Local jsonl now; POST to a shared server the day
     you get a second user — callers never change.)"""
     row = {"ts": time.time(), **event}
-    path = load_config().ledger_path
+    path = _cfg().ledger_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
+    with _LOCK, path.open("a") as f:    # the lock: two simultaneous appends must never interleave
         f.write(json.dumps(row) + "\n")
 
 def trace(**filters) -> list[dict]:
     """The only reader (history-replay + the live viewer tail this). NB: this 'resume' means
     council re-reading its OWN ledger — NOT 'code --resume', which is Claude Code's session resume."""
-    path = load_config().ledger_path
+    path = _cfg().ledger_path
     if not path.exists():
         return []
     rows = (json.loads(l) for l in path.read_text().splitlines() if l.strip())
@@ -218,19 +228,11 @@ independent places** that break the single-writer assumption:
 > current happy path. Worth fixing anyway, because code mode triggers it for real.
 
 **The fix belongs in G4, not G1/G3** — precisely because there are now *two* concurrent callers. One
-module-level lock at the seam covers both (the debate threads and the code pumps are all same-process):
+module-level lock at the seam covers both (the debate threads and the code pumps are all same-process).
 
-```python
-import threading
-_LOCK = threading.Lock()
-
-def record(event: dict) -> None:
-    row = {"ts": time.time(), **event}
-    path = load_config().ledger_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with _LOCK, path.open("a") as f:        # ← one lock fixes both triggers
-        f.write(json.dumps(row) + "\n")
-```
+**[MERGED 3 Jul 2026]** The lock — plus an `lru_cache`'d config read (`record()` used to call
+`load_config()` per event, i.e. per token chunk in code mode) — now lives **in the primary `ledger.py`
+listing above**. There is exactly ONE `record()` in this manuscript; port that one.
 
 > Same-process only. The day council goes multi-process you'd switch to `os.open(…, O_APPEND) +
 > os.write(full_line)` or file-locking — but that's the multi-user swap the seam already defers.
@@ -239,9 +241,9 @@ def record(event: dict) -> None:
 Thin top, one call at the bottom, per command.
 
 ```python
-"""council/cli.py — the front door: 3 commands, thin.
+"""council/cli.py — the front door: 2 commands, thin.  (`review` CUT from v1 — see G6, 3 Jul 2026.)
 ↔ omnigent cli.py:1161 (group), :1241 (main), the `claude` command (→ code), the `run` command (→ ask).
-Dropped: 21 commands, ~28k lines of plumbing."""
+Dropped: 22 commands, ~28k lines of plumbing."""
 from __future__ import annotations
 import sys, click
 from rich.console import Console
@@ -253,22 +255,32 @@ console = Console()
 @click.group()
 @click.version_option()
 def cli() -> None:
-    """council — think, code, and review with a cross-family second opinion."""
+    """council — think and code with a cross-family second opinion."""
 
 @cli.command()
 @click.argument("question", required=False)
-@click.option("-p", "--prompt", default=None, help="The question to think through.")
-@click.option("--rounds", default=None, type=int, help="Debate rounds (default: config).")
-@click.option("--judge", is_flag=False, flag_value="moderator", default=None,
-              type=click.Choice(["moderator", "reasoning"]),
-              help="Optional judge: bare --judge = moderator (neutral merge); --judge reasoning = verdict, may escalate.")
-def ask(question, prompt, rounds, judge):
-    """THINK — debate a question across families (Claude vs Codex)."""
+@click.option("-p", "--prompt", default=None, help="One-shot question (answer once, exit).")
+@click.option("--rounds", default=None, type=int, help="Debate rounds when duelling (default: config).")
+@click.option("--judge", default=None, type=click.Choice(["moderator", "reasoning"]),
+              help="Judge style — explicit value REQUIRED (a bare --judge used to eat the question).")
+@click.option("--duel/--no-duel", default=False, help="Start with the codex adversary ON (toggle live with /duel).")
+def ask(question, prompt, rounds, judge, duel):
+    """THINK — chat with Claude; summon the codex adversary per-question with /duel."""
     cfg = load_config()
+    if rounds is not None: cfg.rounds = rounds       # CLI flags must reach EVERY turn, not just
+    if judge is not None:  cfg.judge_style = judge   # the first — the renderer reads cfg each turn
     render_banner(console, cfg, "ask")
-    q = prompt or question or console.input("[bold blue]›[/] ")
-    from .debate import run as debate_run            # G2 seam
-    debate_run(q, rounds=rounds or cfg.rounds, judge=judge, cfg=cfg, console=console)  # console=console: G1 delta
+    from .chat import run_loop                        # G1 loop
+    from .debate import DebateRenderer                # G2 seam
+    renderer = DebateRenderer(cfg, console, adversarial=duel)
+    q = prompt or question
+    if q:                                             # one-shot: answer once (solo or duel) and exit
+        from .ledger import record
+        record({"role": "session_start"})             # else _history_preamble inherits the PREVIOUS
+        record({"role": "user", "text": q})           # session's tail as stale "memory"
+        renderer.handle(q)
+        return
+    run_loop(renderer, cfg, console)                  # DEFAULT: interactive chat; /duel toggles codex
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.option("--resume", default=None, help="Resume the last coding session.")
@@ -289,21 +301,16 @@ def code(resume, claude_command, claude_args):
         cfg=cfg,
     )
 
-@cli.command()
-@click.argument("target", required=False)  # commit range / path; default = staged diff
-def review(target):
-    """REVIEW — cross-family review via codex (the-harness engine, no Claude)."""
-    cfg = load_config()
-    render_banner(console, cfg, "review")
-    from .review import run as review_run            # G6 seam → scripts/call-reviewer.sh
-    review_run(target, cfg=cfg)
+# `review` command: CUT from v1 (3 Jul 2026). It imported a `review.py` that never existed
+# (G6 defines launch.py + call-reviewer.sh instead) → guaranteed ImportError. Two-mode goal
+# = ask + code; the G6 section stays as documented future work.
 
 def main() -> None:
     cli(standalone_mode=True)
 ```
 
 > **Reading it** — every command is "thin top, one call at the bottom": load config → paint banner →
-> hand off to the engine seam (`ask`→G2 debate, `code`→G3 wrap, `review`→G6). **About `--resume` in
+> hand off to the engine seam (`ask`→G1 loop + G2 renderer, `code`→G3 wrap). **About `--resume` in
 > `code`:** it is *not* a council subsystem — it's a **pass-through** to the real `claude` binary's own
 > local session resume (`save_launch_cwd` just remembers which project folder you launched in). The
 > resume council *dropped* (in G3) was omnigent's separate, server-based cold-resume; Claude Code's own
@@ -328,8 +335,9 @@ class Renderer(Protocol):
     def handle(self, user_input: str) -> None: ...
 
 def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
-    """Read → record → dispatch → render, until exit. Identical for ask and review."""
-    while True:
+    """Read → record → dispatch → render, until exit."""
+    record({"role": "session_start"})        # memory boundary: the history preamble (G2) only reads
+    while True:                              # ledger rows AFTER the latest session_start
         try:
             text = console.input("[bold blue]›[/] ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -337,29 +345,42 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
         if text in ("/exit", "/quit", "exit", "quit"):
             break
         if text.startswith("/"):
-            _slash(text, console)
+            _slash(text, renderer, console)  # slash commands may mutate renderer state (/duel)
             continue
         if not text:
             continue
         record({"role": "user", "text": text})
         renderer.handle(text)
 
-def _slash(text: str, console: Console) -> None:
+def _slash(text: str, renderer, console: Console) -> None:
+    """The 'fake toggle': /duel just flips a boolean on the renderer — no UI widget, same trick
+    Claude Code's own toggles use. TIMING IS FREE: handle() blocks until the turn is done, so a
+    toggle can never interrupt a turn in flight — it takes effect on the NEXT question."""
     if text == "/help":
-        console.print("ask · code · review  |  /new  /exit")
+        console.print("/duel [on|off] — toggle the codex adversary  |  /new  /exit")
+    elif text.startswith("/duel"):
+        import shutil
+        arg = (text.split()[1:] or ["toggle"])[0]
+        renderer.adversarial = {"on": True, "off": False}.get(arg, not renderer.adversarial)
+        if renderer.adversarial and not shutil.which(renderer.cfg.codex_command):
+            renderer.adversarial = False     # fail loud, not a one-voiced "debate"
+            console.print("[red]✗ codex not found — install @openai/codex first; staying solo[/]")
+        else:
+            console.print("⚔ adversary ON — codex will cross-examine every answer"
+                          if renderer.adversarial else "adversary off — plain claude chat")
 ```
 
-> **Reading it** — `run_loop` is the "keep chatting until quit" engine for **ask/review**. `while True`
+> **Reading it** — `run_loop` is the "keep chatting until quit" engine for **ask**. `while True`
 > loops until a `break`. Each pass: read a line (`console.input`; the `try/except` makes Ctrl-D/Ctrl-C
 > quit cleanly) → handle quit-words / slash-commands / empty input (`continue` = skip to the next loop)
 > → `record()` the turn → `renderer.handle(text)`. **The seam:** the loop never knows *which* engine
-> runs — it just calls `handle`; ask plugs in `DebateRenderer`, review plugs in a codex renderer.
+> runs — it just calls `handle`; ask plugs in `DebateRenderer` (solo claude by default, debate on /duel).
 > `Renderer` (a `Protocol`) just means "any object with a `handle(str) -> None` method." Think of
 > `run_loop` as a *waiter*: it takes your order and carries it to whatever kitchen is plugged in — it
 > never cooks.
 
-> **G1 caveat:** `run_loop` fits ASK and REVIEW (input → response → render). **CODE does not** — it's a
-> live attached session (G3) that owns its own loop and doesn't return per-turn. So: ask/review share
+> **G1 caveat:** `run_loop` fits ASK (input → response → render). **CODE does not** — it's a
+> live attached session (G3) that owns its own loop and doesn't return per-turn. So: ask uses
 > `run_loop`; **code** launches the G3 wrap directly and shares only banner + ledger + config.
 
 ---
@@ -382,10 +403,18 @@ loop + two subprocesses. ~95 lines vs Debby's 352.
 > `chat.py`, kept separate so the engine can be called once or many times. Two paths reach it:
 >
 > ```
-> ONE-SHOT   (council ask "q"):   cli.ask() ──► debate.run(q)           # no loop at all
-> INTERACTIVE (chat session):     run_loop(DebateRenderer)
->                                     └ each turn ─► DebateRenderer.handle(text) ──► debate.run(text)
+> ONE-SHOT   (council ask "q"):    cli.ask() ──► DebateRenderer.handle(q)    # answer once, exit
+> INTERACTIVE (council ask, DEFAULT): run_loop(DebateRenderer)
+>                                     └ each turn ─► DebateRenderer.handle(text)
+>                                          ├ /duel OFF (default) ─► proposer only — plain claude chat, WITH memory
+>                                          └ /duel ON            ─► debate.run(text)   🟠 vs 🔵
 > ```
+>
+> **Memory (both paths):** the heads are stateless subprocesses, so `handle` prepends a
+> `_history_preamble` rebuilt from the ledger each turn — that preamble IS codex's memory (it has no
+> session of its own; claude's head is equally stateless in ask mode — native `--resume` is a v2
+> efficiency upgrade for the claude side only). Code mode needs none of this: the hidden real Claude
+> Code remembers natively; there the ledger is only a diary.
 >
 > Same engine at the bottom of both; the only difference is whether a loop wraps it.
 >
@@ -487,7 +516,7 @@ from rich.live import Live
 from rich.table import Table
 from .config import Config
 from .backends import proposer, adversary
-from .ledger import record
+from .ledger import record, trace
 
 @dataclass
 class DebateResult:
@@ -509,9 +538,10 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     record({"role": "debate", "round": 0, "proposer": a, "adversary": b})
     for n in range(1, rounds + 1):
         prev_a, prev_b = a, b
+        # Question stays in EVERY round — without it heads drift into critiquing prose style
         a, b = _both(
-            f"Your last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\nCRITIQUE, then update.",
-            f"Your last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\nCRITIQUE, then update.",
+            f"Question:\n{question}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\nCRITIQUE, then update.",
+            f"Question:\n{question}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\nCRITIQUE, then update.",
             cfg, console)
         record({"role": "debate", "round": n, "proposer": a, "adversary": b})
         if _moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10:        # deterministic early-stop
@@ -572,13 +602,44 @@ def _synthesize(question, r, *, style, cfg, console):
     console.print(f"\n[bold]## ⚖ Synthesis[/] ({style})\n{verdict}")
     return r
 
+def _history_preamble(cfg: Config) -> str:
+    """Ask-mode MEMORY. Heads are stateless subprocesses (`claude -p` / `codex exec` die per call),
+    so council rebuilds context every turn from the ledger. This preamble is the ONLY memory the
+    codex head has; it also lets a mid-conversation `/duel on` hand codex the whole back-story.
+    Scoped to THIS session: only rows after the latest session_start (else a fresh `council ask`
+    would 'remember' last week). Truncated hard — each turn ships this to up to 2 heads × N rounds."""
+    rows = trace()
+    starts = [i for i, r in enumerate(rows) if r.get("role") == "session_start"]
+    rows = rows[starts[-1] + 1:] if starts else rows
+    turns = []
+    for r in rows:
+        if r.get("role") == "user":
+            turns.append(f"USER: {r['text']}")
+        elif r.get("role") == "debate" and r.get("round") is not None:
+            turns.append(f"CLAUDE: {str(r.get('proposer', ''))[:800]}"
+                         + (f"\nCODEX: {str(r['adversary'])[:800]}" if r.get("adversary") else ""))
+    if rows and rows[-1].get("role") == "user":
+        turns.pop()          # the loop records the CURRENT question before handle() runs — don't
+                             # echo it back as "history"; it arrives as the question itself
+    text = "\n\n".join(turns[-cfg.history_turns * 2:])[-8000:]   # last N turns, ~8k char cap
+    return f"Conversation so far (context — do not re-answer old turns):\n{text}\n\n---\n\n" if text else ""
+
 class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
-    """3-line adapter so the one-shot `ask` and the interactive loop share ONE engine.
+    """The /duel two-way branch. adversarial=False (DEFAULT) → plain claude chat, one subprocess,
+    cheap turns. adversarial=True → the full 🟠vs🔵 debate. run_loop's /duel flips the flag live;
+    it takes effect next turn (handle blocks, so a turn in flight always finishes first).
     Style from cfg.judge_style (whether/how); family from cfg.heads.judge (who)."""
-    def __init__(self, cfg: Config, console: Console):
-        self.cfg, self.console = cfg, console
+    def __init__(self, cfg: Config, console: Console, adversarial: bool = False):
+        self.cfg, self.console, self.adversarial = cfg, console, adversarial
     def handle(self, user_input: str) -> None:
-        run(user_input, rounds=self.cfg.rounds, judge=self.cfg.judge_style, cfg=self.cfg, console=self.console)
+        pre = _history_preamble(self.cfg)                       # both branches get the same memory
+        if not self.adversarial:                                # SOLO: claude only, with memory
+            out = _safe(proposer, pre + user_input, self.cfg, "claude")
+            record({"role": "debate", "round": 0, "proposer": out, "adversary": None})
+            self.console.print(f"[orange1]## 🟠 Claude[/]\n{out}")
+            return
+        run(pre + user_input, rounds=self.cfg.rounds,           # DUEL: the full debate engine
+            judge=self.cfg.judge_style, cfg=self.cfg, console=self.console)
 ```
 
 ### FILE: `council/skills/debate/SKILL.md`
@@ -849,7 +910,7 @@ The PreToolUse gate. Three **pure** translation functions (no I/O) → trivial t
 | council uses | ← omnigent fn:line | what it does (in → out) | verdict |
 |---|---|---|---|
 | payload → request | `hook_payload_to_evaluation_request`:91 | hook event + payload → a normalized eval request, or None | KEEP |
-| verdict → output | `evaluation_response_to_hook_output`:171 | event + policy verdict → Claude hook JSON. **ALLOW→None** so the user's own consent gate still fires; DENY→"deny"; stray ASK→fail closed | KEEP |
+| verdict → output | `evaluation_response_to_hook_output`:171 | event + policy verdict → Claude hook JSON. **ALLOW→None** so the user's own consent gate still fires; DENY→`"deny"`; **ASK→`"ask"`** (pops Claude Code's native y/n prompt — schema verified vs claude 2.1.199 docs, 3 Jul 2026) | KEEP (ASK remapped) |
 | fail closed | `fail_closed_hook_output`:276 | event → PreToolUse=deny, others=None (phase-aware) | KEEP |
 | dispatch | `claude_native_hook.main`:72, `_main_evaluate_policy`:803, `_main_permission_request`:658 | route a hook invocation to the right mode | KEEP (decision only) |
 | ✂ drop | `post_evaluate_with_retry`:319, `_post_hook_with_reattach`:565, rotation 240–492, `pending_approvals.py` | POST the decision to the server + server-side queue | **DROP** → call G5 in-process |
@@ -982,6 +1043,7 @@ if __name__ == "__main__":              # claude invokes it as: python -m counci
 # with NO screen-scraping. THIS is what shrinks the fragile camera to nothing.
 import json, time
 from pathlib import Path
+from ..ledger import record          # G4 — torn lines get logged, not swallowed
 
 class SessionState:
     def __init__(self, bridge: Path):
@@ -1003,7 +1065,14 @@ class SessionState:
         for line in lines:
             if not line.strip():
                 continue
-            m = json.loads(line)
+            try:
+                m = json.loads(line)
+            except json.JSONDecodeError:
+                # A torn line here raises in the DAEMON thread → Python kills it SILENTLY →
+                # .busy freezes True → the input box locks FOREVER with no visible cause.
+                # Skip-and-log is safe: markers are cumulative state, the next good one corrects.
+                record({"role": "state_parse_error", "line": line[:200].decode(errors="replace")})
+                continue
             self.busy = (m["state"] == "busy")               # last marker in the batch wins
             if m["event"] == "UserPromptSubmit":
                 self.last_submit_ts = m["ts"]                # tracked SEPARATELY — see H2 race note
@@ -1034,24 +1103,34 @@ class SessionState:
 # ═══ H1c — REGISTER the three events (patches bridge.write_hook_settings @658) ═
 # The @658 stub becomes real. council's three events STACK on the-harness's ~/.claude
 # hooks AND on council's own MessageDisplay/PreToolUse — claude runs them all.
-import json, sys
+import json, shlex, sys
 from pathlib import Path
 
 def write_hook_settings(bridge: Path) -> None:
-    state_cmd = f"{sys.executable} -m council.wrap.state_hook {bridge}"        # ← H1a
+    # THE #1 FRESH-CLONE TRAP: these commands run INSIDE claude's process tree, from claude's
+    # cwd — NOT council's repo. `sys.executable` pins the right python, but `-m council.…` only
+    # resolves if the package is importable THERE. Defense in depth: (a) `pip install -e .` is a
+    # documented setup requirement; (b) PYTHONPATH below makes hooks work even on a raw clone;
+    # (c) session.py runs `{py} -m council.wrap.state_hook --check` ONCE before launching tmux
+    #     and aborts with "run pip install -e ." — fail loud at launch, never silently later.
+    pkg_root = Path(__file__).resolve().parents[2]      # the repo root containing council/
+    py = shlex.quote(sys.executable)                    # quote: home dirs can contain spaces
+    env = f"PYTHONPATH={shlex.quote(str(pkg_root))}"
+    b = shlex.quote(str(bridge))
+    state_cmd = f"{env} {py} -m council.wrap.state_hook {b}"                   # ← H1a
     settings = {
         "hooks": {
             "MessageDisplay": [{"hooks": [{"type": "command",
-                "command": f"{sys.executable} -m council.wrap.render {bridge}"}]}],
+                "command": f"{env} {py} -m council.wrap.render {b}"}]}],
             "PreToolUse":     [{"hooks": [{"type": "command",
-                "command": f"{sys.executable} -m council.wrap.harness_status {bridge}"}]}],
+                "command": f"{env} {py} -m council.wrap.harness_status {b}"}]}],
             # ↓ H1: the interlock — one command wired to three turn-boundary events
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": state_cmd}]}],
             "Stop":             [{"hooks": [{"type": "command", "command": state_cmd}]}],
             "StopFailure":      [{"hooks": [{"type": "command", "command": state_cmd}]}],
         },
         "statusLine": {"type": "command",
-                       "command": f"{sys.executable} -m council.wrap.state {bridge}"},
+                       "command": f"{env} {py} -m council.wrap.state {b}"},
     }
     (bridge / "council-settings.json").write_text(json.dumps(settings, indent=2))
 
@@ -1062,10 +1141,20 @@ def write_hook_settings(bridge: Path) -> None:
 #          renders as "working…", never a hang or a premature double-type.
 # (renderer.notice/.error = two new console-print methods on the G3 Renderer.)
 def _input_pump(bridge: Path, renderer, state: SessionState, cfg) -> None:
-    while True:
+    stalls = 0                # ESCAPE HATCH: the happy path depends on Stop ARRIVING. If claude
+    while True:               # crashed / pane died / hooks broken, it never does — bound the wait.
         if not state.wait_idle(timeout=cfg.turn_timeout):
-            renderer.notice("Claude still working…")          # H1: box stays LOCKED while busy
+            stalls += 1
+            if stalls >= 2:                                   # 2× turn_timeout with no event: check
+                if not _pane_alive(bridge):                   # ground truth (tmux has-session)
+                    renderer.error("hidden claude died — session over"); return
+                renderer.error(f"no Stop event in {stalls * cfg.turn_timeout}s — "
+                               "unlocking input (interlock degraded)")
+                state.busy = False    # manual override: worst case = the pre-H1 world (typing
+            else:                     # while busy) — strictly better than hanging forever
+                renderer.notice("Claude still working…")      # H1: box stays LOCKED while busy
             continue
+        stalls = 0
         try:
             text = renderer.read_input()                      # box is live only now
         except (EOFError, KeyboardInterrupt):
@@ -1137,9 +1226,9 @@ def status_line_wrapper(bridge_dir: str, chain: str | None) -> int:
 #### Config knobs these assume (G1 `config.py`)
 
 ```python
-# Two fields H1/H2 read — add to the @dataclass Config (G1). (D4's "timing → config"
-# arrives early because H2 needs a real, tunable submit deadline now.)
-turn_timeout: int = 600      # H1: max wait for a turn to finish before re-enabling the box
+# [MERGED 3 Jul 2026] These two fields (plus history_turns, and head_timeout 120→300) now live
+# IN the G1 @dataclass Config listing — nothing left to add at port time.
+turn_timeout: int = 600      # H1: max wait for a turn to finish before the stall check
 submit_timeout: int = 10     # H2: max wait to confirm a paste submitted before failing loud
 ```
 
@@ -1286,10 +1375,14 @@ function:
 ### How the verdict is surfaced (the G3 hand-off)
 
 G5 only *classifies*; **G3's `harness_status` decides what to do with each verdict** (`groups.md` G3 table):
-**ALLOW → `None`** (defer to Claude's own consent gate), **DENY → `"deny"`**, and a **stray ASK → fail
-closed** in v1 (a hook can't cleanly render an interactive prompt mid-stream, so council errs safe).
-Wiring ASK to Claude Code's native `ask` permission decision instead is the one thing to verify against
-`claude`'s current hook schema before relying on it.
+**ALLOW → `None`** (defer to Claude's own consent gate), **DENY → `"deny"`**, **ASK → `"ask"`** (Claude
+Code renders its own native permission prompt — council's hook stays non-interactive).
+
+> **VERIFIED (claude 2.1.199 + official hooks docs, 3 Jul 2026):** PreToolUse hook output is
+> `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"|"deny"|"ask"|"defer",
+> "permissionDecisionReason": "…"}}`. `"ask"` escalates to the user's own consent UI; `"defer"` explicitly
+> falls through to the normal permission flow (the ALLOW→None trick, made explicit). The earlier v1 plan
+> ("stray ASK → fail closed") is DEAD — it would have silently denied every `git push`.
 
 ## G5 in one breath
 
@@ -1319,45 +1412,43 @@ Full per-line map: `reference/omnigent/MAPPING.md`.
 Full-manuscript review verdict: design is sound, but a handful of real implementation traps —
 and one genuine mismatch with the stated use case. Worst first.
 
-## C0 — THE BIG ONE: `ask` as written doesn't give back-and-forth
+## C0 — THE BIG ONE: `ask` as written doesn't give back-and-forth  **[RESOLVED 3 Jul 2026 — the /duel redesign]**
 
 The stated use case is interactive adversarial dialogue ("the model and me talk back and forth").
-Three gaps:
+Resolution went FURTHER than the original fix: ask mode is now a **plain Claude chat by default**,
+with the codex adversary summoned per-question via a `/duel` toggle (a slash command flipping a
+boolean on the renderer — no UI widget). Cheap turns stay cheap (1 subprocess); you pay the
+adversarial tax only when a claim is worth stress-testing. The toggle takes effect on the NEXT
+turn for free — `handle()` blocks, so a turn in flight always finishes first. The three gaps:
 
-1. **The interactive loop is never wired in.** `cli.py`'s `ask` does
-   `q = prompt or question or console.input(...)` → one `debate_run(q)` → exit. `run_loop` +
-   `DebateRenderer` exist in the manuscript but no code path calls them. **Fix:** when no question
-   is given (or via `--chat`), construct `DebateRenderer(cfg, console)` and enter `run_loop`.
-2. **Even the interactive path has no memory.** `DebateRenderer.handle` calls `debate.run(user_input)`
-   fresh each turn; heads are stateless subprocesses (`claude -p`, `codex exec` — new process per
-   call). Turn 2 knows nothing about turn 1. **Fix (highest-value):** thread a rolling transcript
-   (last N turns from the ledger via `trace()`) into every head prompt. Without it, "back and forth"
-   is repeated cold-starts.
-3. **Critique rounds drop the original question.** Rounds 1..N send only "your last answer + the
-   other voice's answer." Heads drift. **One-line fix:** prepend `Question:\n{question}\n\n`.
+1. ~~The interactive loop is never wired in.~~ **FIXED** — `cli.ask` with no question now enters
+   `run_loop(DebateRenderer)`; a given question runs one-shot through the same renderer.
+2. ~~No memory between turns.~~ **FIXED** — `_history_preamble` (debate.py) rebuilds the last
+   `cfg.history_turns` turns from the ledger each call, scoped to the current session via a
+   `session_start` marker, current-turn echo excluded. This preamble is the ONLY memory the codex
+   head has — which also makes a mid-conversation `/duel on` context-complete. (v2 upgrade: the
+   claude head can use native `claude -p --resume` instead of the paste; codex keeps the preamble.)
+3. ~~Critique rounds drop the original question.~~ **FIXED** — `Question:` prepended every round.
 
 ## Per-group findings
 
 ### G1 — FRONT
-- `cli.py review` imports `from .review import run` but **no `review.py` exists** (G6 lists
-  `launch.py` + `scripts/call-reviewer.sh`) → ImportError on first `council review`.
-  **Recommendation: cut the `review` command from v1 entirely** (two-mode goal = ask + code).
-- `--judge` with `is_flag=False, flag_value="moderator"`: `council ask --judge "my question"` eats
-  the question as the judge value and fails Choice validation. Document ordering or make it a plain
-  choice with explicit value.
-- `record()` calls `load_config()` on **every event** — a config-file read per delta in code mode.
-  Cache it (module-level or `lru_cache`).
-- The **locked** `record()` (G4 note) vs the unlocked primary `ledger.py` listing: make sure the
-  locked body is what lands in the port.
+- **[RESOLVED]** ~~`cli.py review` imports a `review.py` that doesn't exist → ImportError.~~
+  The `review` command is CUT from v1 (cli.py, tables, banner all updated); G6 stays as future work.
+- **[RESOLVED]** ~~`--judge` flag_value eats the question.~~ `--judge` now requires an explicit
+  value (`--judge moderator`); the ambiguous bare-flag form is gone.
+- **[RESOLVED]** ~~`record()` calls `load_config()` per event.~~ `lru_cache`'d `_cfg()` in ledger.py.
+- **[RESOLVED]** ~~locked vs unlocked `record()`.~~ Merged — the primary listing IS the locked one.
 
 ### G2 — DEBATE
-- `head_timeout: 120` too low; hard questions through `codex exec` / extended thinking exceed 2 min
-  → spurious `head_error` rows, one-voiced debates. Default **300–600 s** for ask mode.
-- `codex exec` stdout is not just the answer (session headers/metadata). Verify live; likely need
-  `--json`/last-message handling. Same class as the `--allowedTools ""` verification for `claude -p`.
-- **Judge reuses proposer/adversary**, which prepend `HEAD_PROMPT` — judge is told it's one of two
-  debate voices, then given instructions matching neither mode. Add a third thin function (or system
-  param) without the debate head prompt.
+- **[RESOLVED]** ~~`head_timeout: 120` too low.~~ Default now **300 s** in the G1 Config listing.
+- **[OPEN — verify live]** `codex exec` stdout is not just the answer (session headers/metadata).
+  Verify live; likely need `--json`/last-message handling. Same class as the `--allowedTools ""`
+  verification for `claude -p`. (codex CLI installed 3 Jul 2026 — needs auth, then verify.)
+- **[OPTIONAL — deferred by design]** Judge reuses proposer/adversary, which prepend `HEAD_PROMPT` —
+  judge is told it's one of two debate voices, then given instructions matching neither mode. The judge
+  is intentionally off by default and out of v1 scope; if/when it's ever turned on, add a third thin
+  function (or system param) without the debate head prompt. Kept here as future reference only.
 - `claude -p` in the proposer still loads `~/.claude` → the-harness hooks + global settings apply to
   debate calls. Probably harmless with tools off, but not a clean-room call.
 
@@ -1365,34 +1456,36 @@ Three gaps:
 - **Terminal contention** unaddressed: output pump paints Rich from a daemon thread while main
   thread blocks in `read_input()`. H1 interlock mostly saves it, but permission prompts / late
   deltas can interleave. Plan a Rich `Live` layout with pinned input row; accept v1 jank.
-- `python -m council.wrap.state_hook` only works if `council` is importable **from the hook's
-  environment** (claude's process tree/cwd, not the repo). `sys.executable` pins Python, but the
-  package must be `pip install -e .`'d (or PYTHONPATH in the hook command). **#1 fresh-clone trap.**
-- **Verify `MessageDisplay` is a real hook event** the same way UserPromptSubmit/Stop/StopFailure
-  were live-verified — it's taken on faith from omnigent. If absent, the live-delta channel is
-  silently dead (degraded to transcript finals, not broken — but know which world before `render.py`).
-- `SessionState.poll()` has no try/except around `json.loads` — one torn line kills the reader in
-  the daemon thread, silently; box locks forever. Wrap and skip bad lines.
-- `_input_pump` can loop "Claude still working…" forever if Stop never fires. After 2–3 consecutive
-  `turn_timeout`s: check pane alive (`tmux has-session`), then unlock with warning or exit loudly.
+- **[RESOLVED]** ~~`-m council.…` importability (#1 fresh-clone trap).~~ Triple defense in
+  `write_hook_settings`: documented `pip install -e .` + `PYTHONPATH` injected into every hook
+  command (shlex-quoted) + a launch-time `--check` self-probe that aborts loudly.
+- **[OPEN — verify live]** **Verify `MessageDisplay` is a real hook event** the same way
+  UserPromptSubmit/Stop/StopFailure were live-verified — it's taken on faith from omnigent. If
+  absent, the live-delta channel is silently dead (degraded to transcript finals, not broken —
+  but know which world before `render.py`).
+- **[RESOLVED]** ~~`SessionState.poll()` bare `json.loads`.~~ try/except + skip + a
+  `state_parse_error` ledger row — a torn line can no longer freeze the box forever.
+- **[RESOLVED]** ~~`_input_pump` loops forever if Stop never fires.~~ Stall counter: after 2×
+  `turn_timeout`, dead pane → clean exit; live pane → unlock with an "interlock degraded" warning.
 - **statusLine is single-valued** (doesn't stack like hooks) — council's `--settings` silently
   replaces the user's. The `_chain` param exists in the sketch; don't skip implementing it.
 
 ### G4 — PERSISTENCE
-- Lock version + config caching (above). Also: `trace()` re-reads/parses the whole ledger per call —
-  a live viewer tailing via `trace()` in a loop is O(n²) over a session. Give the viewer an
-  offset-based tail (pattern already exists in `SessionState.poll`).
+- **[RESOLVED]** ~~Lock version + config caching.~~ Both merged into the primary ledger.py listing.
+- **`trace()` usage rule (standing, not a bug):** human-triggered, one-shot reads only — the history
+  preamble (once per turn), replay, debugging filters. NEVER in a machine-paced loop: it re-parses
+  the whole file per call, O(n²) over a session. Polling consumers (live viewer) must use the
+  offset-tail pattern that already exists in `SessionState.poll`.
 
 ### G5 — POLICY
-- v1 "stray ASK → fail closed (deny)" means **every `git push` is silently denied** — feels broken.
-  PreToolUse output supports `"permissionDecision": "ask"` → **wire ASK → native ask now**, not
-  deferred. It's the difference between "gate" and "wall". (Promoted from verify-later to must-do.)
+- **[RESOLVED 3 Jul 2026]** v1 "stray ASK → fail closed (deny)" meant **every `git push` is silently
+  denied** — a wall, not a gate. Fixed: ASK now maps to `"permissionDecision": "ask"` (native prompt),
+  verified live against claude 2.1.199's hooks docs — see the G5 "How the verdict is surfaced" section.
 - Keep `_rm_severity`/`_push_severity` helpers **verbatim** in the port; don't collapse into one regex.
 
 ### G6 — REVIEW
-- Pending, internally inconsistent (`review.py` vs `launch.py`), outside the two-mode goal.
-  **Drop from v1 scope**: delete the cli command, keep the G6 doc section as future work. Resolves
-  every G6 error at zero cost.
+- **[RESOLVED]** ~~Pending, internally inconsistent, outside the two-mode goal.~~ Dropped from v1:
+  cli command deleted, tables/banner updated, G6 doc section kept as future work.
 
 ## Repo-port checklist (before pushing)
 - Vendored omnigent under `reference/`: confirm LICENSE permits redistribution, keep NOTICE intact;
@@ -1402,12 +1495,21 @@ Three gaps:
 - Decide fate of `groups.py` (55 KB) — if superseded sketch, don't port; groups.md is the manuscript.
 - `.gitignore`: `.DS_Store`, `__pycache__/`; note that `~/.council/` ledger contains full
   conversation text (privacy note for a public repo).
-- `Config` dataclass needs `turn_timeout` + `submit_timeout` added (H1/H2 depend on them; G1 listing
-  omits them — flagged at line ~1137; don't miss in the port).
+- ~~`Config` dataclass needs `turn_timeout` + `submit_timeout` added~~ **[DONE]** — both (plus
+  `history_turns`) are now in the G1 listing.
+- codex CLI: installed globally via npm (3 Jul 2026) but **not yet authenticated** — run `codex`
+  once to log in before the first `/duel`; then live-verify its `exec` stdout format (G2 open item).
 
-## Priority order
-1. Wire interactive loop + conversation memory into `ask` (core use case, currently missing).
-2. Drop G6/review from cli.
-3. H1 hardening + `-m`-importability + `json.loads` guards in G3.
-4. ASK → native-ask in G5.
-5. Everything else is polish.
+## Priority order  *(updated 3 Jul 2026 — 1–4 are DONE in the manuscript)*
+1. ~~Wire interactive loop + conversation memory into `ask`.~~ **DONE** — /duel redesign + preamble.
+2. ~~Drop G6/review from cli.~~ **DONE.**
+3. ~~H1 hardening + `-m`-importability + `json.loads` guards in G3.~~ **DONE.**
+4. ~~ASK → native-ask in G5.~~ **DONE** (schema verified vs claude 2.1.199).
+
+Remaining, in order:
+1. **Port the manuscript to real code** (the sketches are now self-consistent).
+2. Live-verify the two on-faith items: `MessageDisplay` hook event (G3) + `codex exec` stdout
+   format (G2 — codex installed, needs auth first).
+3. Implement the statusLine `_chain` param (G3 — statusLine doesn't stack; don't clobber the user's).
+4. Terminal contention in code mode: accept v1 jank, plan a Rich Live layout with pinned input row.
+5. v2: claude head switches from preamble-paste to native `claude -p --resume` memory.
