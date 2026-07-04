@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from functools import lru_cache
@@ -23,9 +24,16 @@ def record(event: dict) -> None:
     you get a second user — callers never change.)"""
     row = {"ts": time.time(), **event}
     path = _cfg().ledger_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with _LOCK, path.open("a") as f:    # the lock: two simultaneous appends must never interleave
-        f.write(json.dumps(row) + "\n")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The ledger holds FULL conversation text — owner-only, and fchmod (not create-mode)
+    # so a ledger born world-readable under an older version gets fixed on the next write.
+    with _LOCK:                         # the lock: two simultaneous appends must never interleave
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, (json.dumps(row) + "\n").encode())
+        finally:
+            os.close(fd)
 
 
 def trace(**filters) -> list[dict]:

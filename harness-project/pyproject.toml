@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "council"
+description = "Think and code with a cross-family second opinion — wraps the real Claude Code binary and summons a Codex adversary on demand."
+requires-python = ">=3.11"          # tomllib (config.py) landed in 3.11
+dependencies = [
+    "click>=8.0",
+    "rich>=13.0",
+]
+dynamic = ["version"]
+
+[project.scripts]
+council = "council.cli:main"
+
+[tool.setuptools]
+packages = ["council", "council.wrap"]
+
+[tool.setuptools.dynamic]
+version = { attr = "council.__version__" }
