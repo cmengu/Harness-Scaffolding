@@ -10,6 +10,8 @@ Adapted portions live primarily in:
   - council/wrap/bridge.py       (tmux inject + camera helpers, near-verbatim)
   - council/wrap/state.py        (statusLine capture, near-whole)
   - council/wrap/tui_contract.py (TUI layout constants)
+  - council/composer.py          (patched-PromptSession composer, adapted from
+                                  omnigent-ui-sdk terminal/_host.py, trimmed)
 
 The full omnigent source is NOT distributed with this repository. A local
 study snapshot is kept (gitignored) under reference/omnigent/; code comments

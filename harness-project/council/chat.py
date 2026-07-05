@@ -4,7 +4,6 @@ Input strip ↔ omnigent-ui-sdk terminal/_host.py (TerminalHost) — the SAME pr
 (prompt_toolkit PromptSession: history + completer + toolbar), minus its layout surgery."""
 from __future__ import annotations
 
-import os
 import sys
 from typing import Callable, Protocol
 
@@ -44,7 +43,9 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
         while True:
             try:
                 text = read_input().strip()
-            except (EOFError, KeyboardInterrupt):
+            except KeyboardInterrupt:
+                continue                     # Ctrl+C abandons the draft, not the session
+            except EOFError:                 # Ctrl+D (or exhausted piped stdin) leaves
                 break
             if text in ("/exit", "/quit", "exit", "quit"):
                 break
@@ -60,58 +61,32 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
 
 
 def _make_prompt(renderer, cfg: Config, console: Console) -> Callable[[], str]:
-    """The B input strip: sticky accent toolbar + ↑-history + slash-completion popup + window
-    title. Content above still scrolls natively — prompt_toolkit owns only the bottom rows,
-    never the alternate screen (the omnigent/Claude-Code principle).
+    """The input cockpit (C2): compact composer zone — separator bar, multiline input,
+    status line — owned at the bottom while content scrolls natively above; never the
+    alternate screen (the omnigent/Claude-Code principle). See composer.py.
     Falls back to plain console.input when stdin isn't a TTY (pipes, scripted runs) or
     prompt_toolkit is missing (stale editable install) — the loop can't tell the difference."""
     def marker() -> str:
         # Mode you can SEE: ⚔ › while the adversary is live, › solo, both in the theme accent.
         return "⚔ ›" if getattr(renderer, "adversarial", False) else "›"
 
-    fallback = lambda: console.input(f"[bold {cfg.accent_color}]{marker()}[/] ")
-    if not sys.stdin.isatty():
-        return fallback
-    try:
-        from prompt_toolkit import PromptSession
-        from prompt_toolkit.completion import Completer, Completion
-        from prompt_toolkit.history import FileHistory
-        from prompt_toolkit.shortcuts import set_title
-        from prompt_toolkit.styles import Style
-    except ImportError:
-        return fallback
-
-    class _Slash(Completer):
-        """Popup only while typing the command word itself — never over arguments."""
-        def get_completions(self, doc, _event):
-            t = doc.text_before_cursor
-            if t.startswith("/") and " " not in t:
-                for cmd, _args, desc in _COMMANDS:
-                    if cmd.startswith(t):
-                        yield Completion(cmd, start_position=-len(t), display_meta=desc)
-
-    history = cfg.ledger_path.parent / "history"
-    history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    history.touch(mode=0o600, exist_ok=True)
-    os.chmod(history, 0o600)                 # typed questions are as private as the ledger
-    session = PromptSession(
-        history=FileHistory(str(history)),
-        completer=_Slash(),
-        style=Style.from_dict({
-            "prompt": f"bold {cfg.accent_color}",
-            "bottom-toolbar": f"noreverse {cfg.accent_color}",
-        }),
-    )
-    set_title(cfg.banner_title.lower())      # tab bar names the agent, omnigent-style
-
-    def toolbar() -> str:
-        # Built once per prompt call, NOT per keystroke — state only moves between turns
-        # (handle() blocks), and _spent() re-reads the whole ledger.
+    def status() -> str:
+        # Re-read per render tick, so /duel · /rounds · /judge flips show without a redraw.
+        # _spent() re-reads the ledger — cheap at solo scale, revisit if the file grows huge.
         duel = "⚔ duel" if getattr(renderer, "adversarial", False) else "solo"
         return (f" — {cfg.banner_title.lower()} · {duel} · rounds {cfg.rounds}"
                 f" · judge {cfg.judge_style or 'off'} · ${_spent():.2f} · /help ")
 
-    return lambda: session.prompt([("class:prompt", f"{marker()} ")], bottom_toolbar=toolbar())
+    fallback = lambda: console.input(f"[bold {cfg.accent_color}]{marker()}[/] ")
+    if not sys.stdin.isatty():
+        return fallback
+    try:
+        from .composer import Composer
+    except ImportError:
+        return fallback
+    return Composer(console, accent=cfg.accent_color, title=cfg.banner_title.lower(),
+                    marker=marker, status=status, commands=_COMMANDS,
+                    history_path=cfg.ledger_path.parent / "history").read
 
 
 def _clear_title() -> None:
