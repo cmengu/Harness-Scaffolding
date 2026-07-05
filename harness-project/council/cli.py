@@ -1,4 +1,4 @@
-"""council/cli.py — the front door: 2 commands, thin.  (`review` CUT from v1 — see G6, 3 Jul 2026.)
+"""council/cli.py — the front door: ask/code write, report/show read.  (`review` CUT from v1 — G6.)
 ↔ omnigent cli.py:1161 (group), :1241 (main), the `claude` command (→ code), the `run` command (→ ask).
 Dropped: 22 commands, ~28k lines of plumbing."""
 from __future__ import annotations
@@ -35,18 +35,21 @@ def ask(question, prompt, rounds, judge, duel):
         cfg.rounds = rounds        # CLI flags must reach EVERY turn, not just
     if judge is not None:
         cfg.judge_style = judge    # the first — the renderer reads cfg each turn
+    from .ledger import record
+    record({"role": "run_start", "mode": "ask"})      # the run's header row — report/show thread on it
     render_banner(console, cfg, "ask")
     from .chat import run_loop                        # G1 loop
     from .debate import DebateRenderer                # G2 seam
     renderer = DebateRenderer(cfg, console, adversarial=duel)
     q = prompt or question
     if q:                                             # one-shot: answer once (solo or duel) and exit
-        from .ledger import record
         record({"role": "session_start"})             # else _history_preamble inherits the PREVIOUS
         record({"role": "user", "text": q})           # session's tail as stale "memory"
         renderer.handle(q)
-        return
-    run_loop(renderer, cfg, console)                  # DEFAULT: interactive chat; /duel toggles codex
+    else:
+        run_loop(renderer, cfg, console)              # DEFAULT: interactive chat; /duel toggles codex
+    from .ledger import RUN_ID                        # exit hint → the run stays addressable
+    console.print(f"[dim]run {RUN_ID} — `council show {RUN_ID}` to replay[/]")
 
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -58,6 +61,8 @@ def code(resume, claude_command, claude_args):
     if sys.platform == "win32":
         raise click.ClickException("council code needs a PTY (macOS/Linux).")
     cfg = load_config()
+    from .ledger import record
+    record({"role": "run_start", "mode": "code"})
     render_banner(console, cfg, "code")
     from .wrap.session import run_claude_session     # G3 seam
     run_claude_session(
@@ -72,6 +77,22 @@ def code(resume, claude_command, claude_args):
 # `review` command: CUT from v1 (3 Jul 2026). It imported a `review.py` that never existed
 # (G6 defines launch.py + call-reviewer.sh instead) → guaranteed ImportError. Two-mode goal
 # = ask + code; the G6 section stays as documented future work.
+
+
+@cli.command()
+@click.option("--days", default=7, show_default=True, help="Aggregation window.")
+def report(days):
+    """REPORT — runs · cost · latency · failure rate from the ledger (read-only)."""
+    from .report import summary
+    console.print(summary(days))
+
+
+@cli.command()
+@click.argument("run_id")
+def show(run_id):
+    """SHOW — replay one run from the ledger (IDs: `council report`)."""
+    from .report import replay
+    replay(run_id, console)
 
 
 def main() -> None:

@@ -2,9 +2,11 @@
 ↔ Debby agents/claude/config.yaml:41-64 + agents/gpt/config.yaml:49-72 (the ANSWER/CRITIQUE prompt)."""
 from __future__ import annotations
 
+import json
 import subprocess
 
 from .config import Config
+from .ledger import record
 
 HEAD_PROMPT = """\
 You are one of two voices in a council. You are a thinking-and-writing responder.
@@ -20,9 +22,20 @@ Return a clear, self-contained response. You have NO tools — reason in text on
 def proposer(message: str, cfg: Config) -> str:
     """Claude head — the REAL `claude` CLI, headless, NO tools.
     Prompt goes via STDIN: `--allowedTools` is variadic and eats a trailing positional
-    prompt as a tool name (live-verified vs claude 2.1.200, 4 Jul 2026)."""
-    return _run([cfg.claude_command, "-p", "--allowedTools", ""], cfg,
-                stdin=HEAD_PROMPT + "\n\n" + message)
+    prompt as a tool name (live-verified vs claude 2.1.200, 4 Jul 2026).
+    `--output-format json` → per-call cost lands in the ledger (fields `result` +
+    `total_cost_usd`, live-verified 5 Jul 2026); a parse failure falls back to raw text —
+    cost capture must NEVER kill the head."""
+    raw = _run([cfg.claude_command, "-p", "--output-format", "json", "--allowedTools", ""],
+               cfg, stdin=HEAD_PROMPT + "\n\n" + message)
+    try:
+        payload = json.loads(raw)
+        usd = payload.get("total_cost_usd")
+        if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+            record({"role": "head_cost", "head": "claude", "usd": float(usd)})
+        return str(payload["result"]).strip()
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return raw
 
 
 def adversary(message: str, cfg: Config) -> str:

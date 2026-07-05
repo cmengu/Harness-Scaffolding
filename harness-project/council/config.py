@@ -36,6 +36,12 @@ class Config:
     boot_probe: bool = False         # D3: spend one turn at launch proving the H2 receipt loop works
     history_turns: int = 6           # ask-mode memory: past turns carried in the ledger preamble
     judge_style: str | None = None   # interactive-loop judge STYLE: None | 'moderator' | 'reasoning'
+    # Theme — the banner/prompt skin. GENERIC defaults on purpose: the public repo stays
+    # unbranded; a private skin (name, accent, mascot) lives in ~/.council/config.toml only.
+    banner_title: str = "COUNCIL"
+    banner_tagline: str = ""         # one-liner under the title (omnigent's "Multi-agent coding …" slot)
+    accent_color: str = "blue"       # rich color name or hex; border + mascot + prompt = ONE accent
+    banner_art: str = ""             # multi-line outline mascot (polly-style); "" = classic banner
     heads: Heads = field(default_factory=Heads)
 
 

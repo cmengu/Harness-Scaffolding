@@ -1,0 +1,97 @@
+"""council/report.py — the READ side of the ledger: the week in review + run replay.
+Everything derives from trace() rows; nothing here writes. This is further_steps step 4:
+run IDs made every run addressable, so 'show' is a formatter, not a storage system."""
+from __future__ import annotations
+
+import time
+
+from rich.console import Console, Group
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
+from .ledger import trace
+
+
+def summary(days: int = 7):
+    """Aggregate the ledger into one screen: runs, cost, latency, failure rate."""
+    cutoff = time.time() - days * 86400
+    rows = [r for r in trace() if r.get("ts", 0) >= cutoff]
+    if not rows:
+        return Text(f"ledger has no rows in the last {days} day(s)", style="dim")
+    runs: dict[str, list[dict]] = {}
+    for r in rows:                                   # rows born before run IDs group as one bucket
+        runs.setdefault(r.get("run_id", "pre-run-id"), []).append(r)
+
+    calls = [r for r in rows if r.get("role") == "head_call"]
+    fails = [c for c in calls if not c.get("ok")]
+    lat = sorted(c.get("secs", 0.0) for c in calls if c.get("ok"))
+    ask_usd = sum(r.get("usd") or 0.0 for r in rows if r.get("role") == "head_cost")
+    # code-mode cost: statusLine's total_cost_usd is a RUNNING session total —
+    # take the max per run and sum those; summing rows would overcount by ~turns.
+    code_usd = sum(m for m in (_code_total(rs) for rs in runs.values()) if m)
+
+    top = Table(show_header=False, box=None, padding=(0, 2))
+    top.add_row("runs", str(len(runs)))
+    top.add_row("head calls", f"{len(calls)}"
+                + (f"  ({len(fails)} failed · {len(fails) / len(calls):.0%})" if calls else ""))
+    if lat:
+        top.add_row("latency", f"median {_pct(lat, 50):.1f}s · p95 {_pct(lat, 95):.1f}s · worst {lat[-1]:.1f}s")
+    top.add_row("cost", f"${ask_usd + code_usd:.2f}  (ask ${ask_usd:.2f} · code ${code_usd:.2f})")
+
+    per = Table(padding=(0, 2))
+    for col in ("run", "started", "mode", "turns", "cost", "errors"):
+        per.add_column(col, justify="right" if col in ("turns", "cost", "errors") else "left")
+    for rid, rs in sorted(runs.items(), key=lambda kv: kv[1][0].get("ts", 0))[-15:]:
+        errors = sum(1 for r in rs if r.get("role") == "head_error")
+        cost = sum(r.get("usd") or 0.0 for r in rs if r.get("role") == "head_cost") + (_code_total(rs) or 0.0)
+        per.add_row(rid, time.strftime("%d %b %H:%M", time.localtime(rs[0].get("ts", 0))), _mode(rs),
+                    str(sum(1 for r in rs if r.get("role") in ("user", "code_user"))),
+                    f"${cost:.2f}" if cost else "—", str(errors) if errors else "—")
+    return Group(Rule(f"last {days} day(s)", style="dim", align="left"), top, per)
+
+
+def replay(run_id: str, console: Console) -> None:
+    """Re-print one run from the ledger: questions, debate columns, verdicts, failures."""
+    rows = trace(run_id=run_id)
+    if not rows:
+        ids = list(dict.fromkeys(r["run_id"] for r in trace() if r.get("run_id")))[-8:]
+        console.print(f"[red]no rows for run {run_id!r}[/] — recent: " + (", ".join(ids) or "none"))
+        return
+    from .debate import _present                     # lazy: replay is the only need here
+    console.print(f"[bold]run {run_id}[/] · {_mode(rows)} · "
+                  f"{time.strftime('%d %b %H:%M', time.localtime(rows[0].get('ts', 0)))}\n")
+    for r in rows:
+        role = r.get("role")
+        if role in ("user", "code_user"):
+            console.print(f"\n[bold]› {r.get('text', '')}[/]")
+        elif role == "debate" and r.get("round") is not None:
+            if r.get("adversary"):
+                _present(console, str(r.get("proposer", "")), str(r["adversary"]))
+            else:
+                console.print(f"[orange1]## 🟠 Claude[/]\n{r.get('proposer', '')}")
+        elif role == "judge":
+            console.print(f"\n[bold]## ⚖ Synthesis[/] ({r.get('style')})\n{r.get('text', '')}")
+        elif role == "code_assistant":
+            console.print(f"[orange1]{r.get('text', '')}[/]")
+        elif role == "code_tool":
+            console.print(f"[dim]⚙ {r.get('name')}  {r.get('summary', '')}[/]")
+        elif role == "head_error":
+            console.print(f"[red]✗ {r.get('head')}: {str(r.get('error'))[:200]}[/]")
+
+
+def _code_total(rs: list[dict]) -> float | None:
+    totals = [r["total_cost_usd"] for r in rs if r.get("role") == "code_context"
+              and isinstance(r.get("total_cost_usd"), (int, float))]
+    return max(totals) if totals else None
+
+
+def _mode(rs: list[dict]) -> str:
+    for r in rs:
+        if r.get("role") == "run_start":
+            return r.get("mode", "ask")
+    return "code" if any(r.get("role") == "code_session" for r in rs) else "ask"
+
+
+def _pct(sorted_vals: list[float], p: int) -> float:
+    return sorted_vals[min(len(sorted_vals) - 1, int(len(sorted_vals) * p / 100))]

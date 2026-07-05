@@ -6,11 +6,17 @@ import json
 import os
 import threading
 import time
+import uuid
 from functools import lru_cache
 
 from .config import load_config
 
 _LOCK = threading.Lock()   # record() has concurrent callers: code-mode pumps + ask-mode failure path
+
+# One process = one run (a single `council ask`/`code` invocation). Safe as a module global
+# because EVERY record() caller lives in the main process — the statusLine hack is a separate
+# process but only writes context.json; render.py reads it back and records from here.
+RUN_ID = uuid.uuid4().hex[:12]
 
 
 @lru_cache(maxsize=1)
@@ -22,7 +28,7 @@ def _cfg():
 def record(event: dict) -> None:
     """The only writer. Append one event. (Local jsonl now; POST to a shared server the day
     you get a second user — callers never change.)"""
-    row = {"ts": time.time(), **event}
+    row = {"ts": time.time(), "run_id": RUN_ID, **event}   # run_id → trace(run_id=…) threads a run
     path = _cfg().ledger_path
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # The ledger holds FULL conversation text — owner-only, and fchmod (not create-mode)

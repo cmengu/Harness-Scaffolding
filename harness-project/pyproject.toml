@@ -9,6 +9,7 @@ requires-python = ">=3.11"          # tomllib (config.py) landed in 3.11
 dependencies = [
     "click>=8.0",
     "rich>=13.0",
+    "prompt-toolkit>=3.0",   # ask-mode input strip: history + toolbar + completion popup
 ]
 dynamic = ["version"]
 

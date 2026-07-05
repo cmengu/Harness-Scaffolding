@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import difflib
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
@@ -67,13 +68,20 @@ def _both(msg_a, msg_b, cfg, console):
 
 
 def _safe(fn, msg, cfg, label):
-    """A panelist's mic cutting out shouldn't kill the panel: one head failing → single-voiced + logged."""
+    """A panelist's mic cutting out shouldn't kill the panel: one head failing → single-voiced + logged.
+    Also the per-call flight recorder: label + try/except both live here, so every head call
+    (judge included) gets a head_call row with real seconds — errors time-stamped for free."""
+    t0 = time.monotonic()
     try:
         out = fn(msg, cfg)
         if not out.strip():
             raise ValueError("empty response")
+        record({"role": "head_call", "head": label, "ok": True,
+                "secs": round(time.monotonic() - t0, 2)})
         return out
     except Exception as e:
+        record({"role": "head_call", "head": label, "ok": False,
+                "secs": round(time.monotonic() - t0, 2), "error": str(e)[:500]})
         record({"role": "head_error", "head": label, "error": str(e)})
         return f"_({label} unavailable: {e})_"
 
@@ -88,11 +96,20 @@ def _status(fa, fb):
 
 
 def _present(console, a, b):
-    cols = Table.grid(padding=(0, 2))
-    cols.add_column()
-    cols.add_column()
-    cols.add_row(f"[orange1]## 🟠 Claude[/]\n{a}", f"[blue]## 🔵 Codex[/]\n{b}")
-    console.print(cols)
+    """Duel output, width-adaptive: side-by-side only when each voice gets readable prose
+    width (≥~52 chars/column at 110 cols); narrower terminals get full-width blocks under
+    rule headers — content owns the terminal, not the layout."""
+    if console.width >= 110:
+        cols = Table.grid(padding=(0, 2))
+        cols.add_column()
+        cols.add_column()
+        cols.add_row(f"[orange1]## 🟠 Claude[/]\n{a}", f"[blue]## 🔵 Codex[/]\n{b}")
+        console.print(cols)
+    else:
+        console.rule("[orange1]🟠 Claude[/]", style="orange1", align="left")
+        console.print(a)
+        console.rule("[blue]🔵 Codex[/]", style="blue", align="left")
+        console.print(b)
 
 
 def _synthesize(question, r, *, style, cfg, console):
@@ -108,7 +125,8 @@ def _synthesize(question, r, *, style, cfg, console):
                    "Weigh the evidence. Give '## Where they agree', '## Where they differ', then a verdict. "
                    "If neither is adequately supported, reply starting with the word ESCALATE and say why.")
     verdict = _safe(judge_fn, f"Question:\n{question}\n\n{blind}\n\n{instruction}", cfg, "judge")
-    r.synthesis = verdict
+    record({"role": "judge", "style": style, "text": verdict})   # the verdict must survive the
+    r.synthesis = verdict                                        # session — /last + replay read it
     r.escalated = (style == "reasoning" and verdict.strip().upper().startswith("ESCALATE"))
     console.print(f"\n[bold]## ⚖ Synthesis[/] ({style})\n{verdict}")
     return r
