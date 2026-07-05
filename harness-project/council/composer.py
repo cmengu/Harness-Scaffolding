@@ -20,14 +20,16 @@ from __future__ import annotations
 import os
 from typing import Callable
 
-from prompt_toolkit import PromptSession
+from prompt_toolkit import Application, PromptSession
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import is_searching
-from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.formatted_text import ANSI, FormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings import search as _search_bindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit, VerticalAlign, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
@@ -54,6 +56,7 @@ class Composer:
         self._accent = accent
         self._marker = marker
         self._status = status
+        self._pending_draft = ""             # survives a Ctrl+O overlay trip (see _bindings)
         _install_shift_enter()
         history_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         history_path.touch(mode=0o600, exist_ok=True)
@@ -78,7 +81,8 @@ class Composer:
     def read(self) -> str:
         """One trip through the composer. After submit the live widget is erased, so the
         input is re-printed as a plain scrollback line — the conversation stays readable."""
-        text = self._session.prompt([("class:prompt", f"{self._marker()} ")])
+        default, self._pending_draft = self._pending_draft, ""   # Ctrl+O stashed a draft?
+        text = self._session.prompt([("class:prompt", f"{self._marker()} ")], default=default)
         if text.strip():
             first, *rest = text.split("\n")
             self.console.print(f"[bold {self._accent}]{self._marker()}[/] {escape(first)}")
@@ -113,6 +117,19 @@ class Composer:
         def _newline(event) -> None:
             event.current_buffer.insert_text("\n")
 
+        # Ctrl+O: open the report overlay — by SUBMITTING "/report" through the normal
+        # dispatch path (no nested Application while the prompt runs; overlays run between
+        # prompts where a fresh app is trivially safe). Any half-typed draft is stashed and
+        # restored as the next prompt's default, so the keystroke never loses work.
+        # (Why not F1/Ctrl+H: terminals intercept F1, and Ctrl+H IS Backspace at the byte
+        # level — both verified unbindable upstream.)
+        @kb.add("c-o", filter=~is_searching)
+        def _overlay(event) -> None:
+            buf = event.current_buffer
+            self._pending_draft = buf.text
+            buf.text = "/report"
+            buf.validate_and_handle()
+
         return kb
 
     def _patch_layout(self) -> None:
@@ -143,6 +160,56 @@ class Composer:
         rows = min(_MAX_INPUT_ROWS, rows)
         menu = _MENU_ROWS if self._session.default_buffer.complete_state else 0
         return Dimension(min=max(1, rows + menu), max=max(1, rows + menu), preferred=rows + menu)
+
+
+def show_overlay(title: str, body_ansi: str, *, accent: str = "cyan") -> None:
+    """A scrollable full-screen viewer for long output (reports, replays). This is the ONE
+    place council borrows the alternate screen — a nested temporary Application, omnigent's
+    overlay dodge for 'inline floats can't exceed the prompt region' — and it gives the
+    screen back on close, scrollback untouched. Runs BETWEEN prompts (plain sync context),
+    so no nested-event-loop machinery is needed.
+    Keys: ↑/↓/PgUp/PgDn/Home/End scroll · q/Esc/Ctrl+C close."""
+    lines = body_ansi.splitlines() or [""]
+    cursor = [0]                             # scrolling = moving an invisible cursor: the
+    body = Window(                           # window's scroll-follow does the rest (mutating
+        FormattedTextControl(                # vertical_scroll directly gets snapped back to
+            ANSI(body_ansi),                 # keep the cursor visible when wrap_lines is on)
+            get_cursor_position=lambda: Point(x=0, y=cursor[0]),
+            show_cursor=False),
+        wrap_lines=True)
+
+    def _page(event) -> int:
+        return max(1, event.app.output.get_size().rows - 2)
+
+    def _scroll(event, delta: int) -> None:
+        cursor[0] = max(0, min(cursor[0] + delta, len(lines) - 1))
+
+    kb = KeyBindings()
+    kb.add("up")(lambda e: _scroll(e, -1))
+    kb.add("down")(lambda e: _scroll(e, +1))
+    kb.add("pageup")(lambda e: _scroll(e, -_page(e)))
+    kb.add("pagedown")(lambda e: _scroll(e, +_page(e)))
+    kb.add("home")(lambda e: _scroll(e, -len(lines)))
+    kb.add("end")(lambda e: _scroll(e, +len(lines)))
+    # Ctrl+C must be bound explicitly: with custom KeyBindings the overlay app has no
+    # default fallback, so an unbound Ctrl+C would appear to do nothing (upstream wart).
+    # Here it CLOSES (council's Ctrl+C means "abandon", not "kill") — as do q and Esc.
+    for key in ("q", "escape", "c-c"):
+        kb.add(key)(lambda e: e.app.exit())
+
+    header = Window(
+        FormattedTextControl(FormattedText([
+            ("class:bar bold", f" {title} "),
+            ("class:bar", "· ↑↓ PgUp PgDn scroll · q close"),
+        ])),
+        height=1, dont_extend_height=True)
+    Application(
+        layout=Layout(HSplit([header, body])),
+        key_bindings=kb,
+        style=Style.from_dict({"bar": f"reverse {accent}"}),
+        full_screen=True,
+        mouse_support=False,
+    ).run()
 
 
 class _SlashCompleter(Completer):

@@ -75,7 +75,7 @@ def _make_prompt(renderer, cfg: Config, console: Console) -> Callable[[], str]:
         # _spent() re-reads the ledger — cheap at solo scale, revisit if the file grows huge.
         duel = "⚔ duel" if getattr(renderer, "adversarial", False) else "solo"
         return (f" — {cfg.banner_title.lower()} · {duel} · rounds {cfg.rounds}"
-                f" · judge {cfg.judge_style or 'off'} · ${_spent():.2f} · /help ")
+                f" · judge {cfg.judge_style or 'off'} · ${_spent():.2f} · ^O report · /help ")
 
     fallback = lambda: console.input(f"[bold {cfg.accent_color}]{marker()}[/] ")
     if not sys.stdin.isatty():
@@ -148,15 +148,33 @@ def _slash(text: str, renderer, console: Console) -> None:
         _last(console)
     elif cmd == "/report":
         from .report import summary
-        console.print(summary(int(arg) if arg.isdigit() else 7))
+        days = int(arg) if arg.isdigit() else 7
+        _view(console, cfg, f"report · last {days} day(s)",
+              lambda: console.print(summary(days)))
     elif cmd == "/show":
         from .report import replay
         if not arg:
             console.print("[red]usage: /show <run-id>[/] — IDs listed by /report")
             return
-        replay(arg, console)
+        _view(console, cfg, f"run {arg}", lambda: replay(arg, console))
     else:
         console.print(f"[dim]unknown command {text!r} — try /help[/]")
+
+
+def _view(console: Console, cfg: Config, title: str, render: Callable[[], None]) -> None:
+    """Long output goes to a scrollable overlay on a TTY, plain print otherwise. The
+    renderable is captured WITH its ANSI styling and replayed inside the overlay."""
+    if not sys.stdin.isatty():
+        render()
+        return
+    try:
+        from .composer import show_overlay
+    except ImportError:
+        render()
+        return
+    with console.capture() as cap:
+        render()
+    show_overlay(title, cap.get(), accent=cfg.accent_color)
 
 
 def _help(cfg: Config, console: Console) -> None:

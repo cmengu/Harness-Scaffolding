@@ -90,8 +90,12 @@ def _moved(prev, now):  # 0=identical, 1=rewritten. Crude on purpose; never fire
     return 1 - difflib.SequenceMatcher(None, prev, now).ratio()
 
 
+_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # wall-clock indexed so redraws from other sources don't jitter it
+
+
 def _status(fa, fb):
-    mark = lambda f: "✓" if f.done() else "…thinking"
+    spin = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
+    mark = lambda f: "✓" if f.done() else f"{spin} thinking"
     return f"🟠 claude {mark(fa)}    🔵 codex {mark(fb)}"
 
 
@@ -124,7 +128,8 @@ def _synthesize(question, r, *, style, cfg, console):
                    if style == "moderator" else
                    "Weigh the evidence. Give '## Where they agree', '## Where they differ', then a verdict. "
                    "If neither is adequately supported, reply starting with the word ESCALATE and say why.")
-    verdict = _safe(judge_fn, f"Question:\n{question}\n\n{blind}\n\n{instruction}", cfg, "judge")
+    with console.status("[dim]⚖ judge weighing…[/]", spinner="dots"):   # 20s+ silent otherwise
+        verdict = _safe(judge_fn, f"Question:\n{question}\n\n{blind}\n\n{instruction}", cfg, "judge")
     record({"role": "judge", "style": style, "text": verdict})   # the verdict must survive the
     r.synthesis = verdict                                        # session — /last + replay read it
     r.escalated = (style == "reasoning" and verdict.strip().upper().startswith("ESCALATE"))
@@ -167,7 +172,8 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
     def handle(self, user_input: str) -> None:
         pre = _history_preamble(self.cfg)                       # both branches get the same memory
         if not self.adversarial:                                # SOLO: claude only, with memory
-            out = _safe(proposer, pre + user_input, self.cfg, "claude")
+            with self.console.status("[dim]🟠 claude thinking…[/]", spinner="dots"):
+                out = _safe(proposer, pre + user_input, self.cfg, "claude")
             record({"role": "debate", "round": 0, "proposer": out, "adversary": None})
             self.console.print(f"[orange1]## 🟠 Claude[/]\n{out}")
             return
