@@ -1,0 +1,11 @@
+#!/bin/sh
+# Transient failure on the FIRST call, success after — the retry loop's happy path.
+# COUNCIL_STUB_MARKER must point at a per-test path (the marker is the call counter).
+cat > /dev/null
+: "${COUNCIL_STUB_MARKER:?claude-flaky-once needs COUNCIL_STUB_MARKER}"
+if [ ! -e "$COUNCIL_STUB_MARKER" ]; then
+    touch "$COUNCIL_STUB_MARKER"
+    echo "connection reset by peer" >&2
+    exit 1
+fi
+echo '{"result": "STUB CLAUDE: recovered on retry", "total_cost_usd": 0.001}'

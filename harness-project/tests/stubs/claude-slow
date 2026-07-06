@@ -1,0 +1,5 @@
+#!/bin/sh
+# Sleeps COUNCIL_STUB_SLEEP seconds (default 5): head_timeout + parallelism tests.
+cat > /dev/null
+sleep "${COUNCIL_STUB_SLEEP:-5}"
+echo '{"result": "STUB CLAUDE: slow but steady", "total_cost_usd": 0.0}'

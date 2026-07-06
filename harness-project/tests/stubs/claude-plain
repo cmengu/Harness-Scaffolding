@@ -1,0 +1,4 @@
+#!/bin/sh
+# Raw-text claude: exercises proposer's JSON-parse fallback (cost capture must never kill the head).
+cat > /dev/null
+echo "STUB CLAUDE PLAIN: not json at all"

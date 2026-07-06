@@ -1,0 +1,6 @@
+#!/bin/sh
+# Always fails like a CLI misuse: permanent class, must NOT be retried.
+cat > /dev/null
+[ -n "$COUNCIL_STUB_COUNT" ] && echo x >> "$COUNCIL_STUB_COUNT"
+echo "error: unexpected argument '--frobnicate' found" >&2
+exit 2

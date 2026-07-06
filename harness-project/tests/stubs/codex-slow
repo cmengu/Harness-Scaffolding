@@ -1,0 +1,5 @@
+#!/bin/sh
+# codex-shaped twin of claude-slow, for the parallel-fanout timing test.
+cat > /dev/null
+sleep "${COUNCIL_STUB_SLEEP:-1}"
+echo "STUB CODEX: slow but steady"

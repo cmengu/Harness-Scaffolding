@@ -13,9 +13,9 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from .backends import Cancelled, adversary, kill_inflight, proposer
+from .backends import Cancelled, _classify, adversary, kill_inflight, proposer
 from .config import Config
-from .ledger import chain_rows, record
+from .ledger import chain_rows, quarantine, record
 
 
 @dataclass
@@ -78,13 +78,30 @@ def _both(msg_a, msg_b, cfg, console):
 def _safe(fn, msg, cfg, label):
     """A panelist's mic cutting out shouldn't kill the panel: one head failing → single-voiced + logged.
     Also the per-call flight recorder: label + try/except both live here, so every head call
-    (judge included) gets a head_call row with real seconds — errors time-stamped for free."""
+    (judge included) gets a head_call row with real seconds — errors time-stamped for free.
+    TRANSIENT failures get cfg.head_retries more tries with exponential backoff (heads are
+    stateless one-shot subprocesses, so a retry is idempotent by construction); a head that
+    stays dead leaves a quarantine postmortem, not just one easy-to-miss ledger row."""
     t0 = time.monotonic()
+    kind, attempts = "permanent", 0
     try:
-        out = fn(msg, cfg)
-        if not out.strip():
-            raise ValueError("empty response")
-        record({"role": "head_call", "head": label, "ok": True,
+        for attempt in range(max(0, cfg.head_retries) + 1):
+            attempts = attempt + 1
+            try:
+                out = fn(msg, cfg)
+                if not out.strip():
+                    raise ValueError("empty response")
+                break
+            except Cancelled:               # a ^C is a decision, not a flake — never retried
+                raise
+            except Exception as e:
+                kind = _classify(e)
+                if kind == "permanent" or attempt >= cfg.head_retries:
+                    raise                   # permanent = retrying is failing slowly; else exhausted
+                record({"role": "head_retry", "head": label, "attempt": attempt,
+                        "kind": kind, "error": str(e)[:500]})   # rows = retries actually taken
+                time.sleep(cfg.retry_base_delay * 2 ** attempt)
+        record({"role": "head_call", "head": label, "ok": True, "attempts": attempts,
                 "secs": round(time.monotonic() - t0, 2)})
         return out
     except Cancelled:                       # user's ^C, not a failure: no head_error row (replay
@@ -94,7 +111,8 @@ def _safe(fn, msg, cfg, label):
     except Exception as e:
         record({"role": "head_call", "head": label, "ok": False,
                 "secs": round(time.monotonic() - t0, 2), "error": str(e)[:500]})
-        record({"role": "head_error", "head": label, "error": str(e)})
+        record({"role": "head_error", "head": label, "kind": kind, "error": str(e)})
+        quarantine(label, e, {"kind": kind, "attempts": attempts, "question": msg})
         return f"_({label} unavailable: {e})_"
 
 

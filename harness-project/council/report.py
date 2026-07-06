@@ -25,6 +25,7 @@ def summary(days: int = 7):
 
     calls = [r for r in rows if r.get("role") == "head_call"]
     fails = [c for c in calls if not c.get("ok") and not c.get("cancelled")]   # a ^C isn't a failure
+    retries = sum(1 for r in rows if r.get("role") == "head_retry")
     lat = sorted(c.get("secs", 0.0) for c in calls if c.get("ok"))
     ask_usd = sum(r.get("usd") or 0.0 for r in rows if r.get("role") == "head_cost")
     # code-mode cost: statusLine's total_cost_usd is a RUNNING session total —
@@ -34,7 +35,8 @@ def summary(days: int = 7):
     top = Table(show_header=False, box=None, padding=(0, 2))
     top.add_row("runs", str(len(runs)))
     top.add_row("head calls", f"{len(calls)}"
-                + (f"  ({len(fails)} failed · {len(fails) / len(calls):.0%})" if calls else ""))
+                + (f"  ({len(fails)} failed · {len(fails) / len(calls):.0%}"
+                   + (f" · {retries} retried" if retries else "") + ")" if calls else ""))
     if lat:
         top.add_row("latency", f"median {_pct(lat, 50):.1f}s · p95 {_pct(lat, 95):.1f}s · worst {lat[-1]:.1f}s")
     top.add_row("cost", f"${ask_usd + code_usd:.2f}  (ask ${ask_usd:.2f} · code ${code_usd:.2f})")
@@ -85,8 +87,18 @@ def render_rows(rows: list[dict], console: Console) -> None:
             console.print(f"[orange1]{r.get('text', '')}[/]")
         elif role == "code_tool":
             console.print(f"[dim]⚙ {r.get('name')}  {r.get('summary', '')}[/]")
+        elif role == "head_retry":
+            console.print(f"[dim]↻ {r.get('head')} retry {r.get('attempt', 0) + 1}"
+                          f" ({r.get('kind')}): {str(r.get('error'))[:120]}[/]")
         elif role == "head_error":
             console.print(f"[red]✗ {r.get('head')}: {str(r.get('error'))[:200]}[/]")
+        elif role == "quarantined":
+            console.print(f"[red]☠ postmortem → {r.get('path')}[/]")
+        elif role == "shadow_arm":
+            ovr = r.get("overrides") or []
+            console.print(f"\n[bold]## arm {r.get('arm')}[/]"
+                          + (f" [dim](+ {' '.join(ovr)})[/]" if ovr else " [dim](current config)[/]")
+                          + f"\n{r.get('answer', '')}")
 
 
 def _code_total(rs: list[dict]) -> float | None:

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Canned codex head. Contract with backends.adversary: prompt arrives as the LAST argv
+# (codex exec style); stdin is explicitly empty and must not be waited on.
+[ -n "$COUNCIL_STUB_ARGV" ] && printf '%s\n' "$@" > "$COUNCIL_STUB_ARGV"
+cat > /dev/null
+echo "STUB CODEX: disagree - the moon is made of cheese"

@@ -125,6 +125,21 @@ def attach(bridge_id):
 
 
 @cli.command()
+@click.option("-p", "--prompt", "prompt", required=True, help="The question both arms answer.")
+@click.option("--set", "overrides", multiple=True, metavar="KEY=VALUE",
+              help="Config override for arm B (repeatable), e.g. --set rounds=2 --set judge_style=reasoning.")
+def shadow(prompt, overrides):
+    """SHADOW — one question under config A (current) and B (A + overrides), side by side."""
+    from .shadow import run_shadow
+    try:
+        run_shadow(prompt, overrides, console)
+    except ValueError as e:                  # malformed --set → a usage error, not a stack trace
+        raise click.ClickException(str(e))
+    from .ledger import RUN_ID
+    console.print(f"[dim]run {RUN_ID} — `council show {RUN_ID}` to replay both arms[/]")
+
+
+@cli.command()
 @click.option("--days", default=7, show_default=True, help="Aggregation window.")
 def report(days):
     """REPORT — runs · cost · latency · failure rate from the ledger (read-only)."""

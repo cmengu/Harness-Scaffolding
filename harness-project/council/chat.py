@@ -74,23 +74,28 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
                 record({"role": "debate", "event": "cancelled"})
                 console.print("\n[yellow]✗ cancelled — answer discarded, question kept out of memory[/]")
             else:
-                _turn_line(console, calls_before, spent_before)
+                _turn_line(console, calls_before, spent_before, cfg)
     finally:
         _clear_title()
 
 
-def _turn_line(console: Console, calls_before: int, spent_before: float) -> None:
+def _turn_line(console: Console, calls_before: int, spent_before: float, cfg: Config) -> None:
     """One dim receipt after each turn: per-head seconds (✗ = that head failed) + the
     turn's cost delta. Data is already in the ledger (head_call/head_cost) — this just
-    surfaces what /report aggregates, while the turn is still on screen."""
+    surfaces what /report aggregates, while the turn is still on screen. When an
+    ask_budget_usd is set and the run has crossed it, the receipt carries a red nag
+    (the code-mode counterpart is the PreToolUse checkpoint ladder)."""
     calls = trace(run_id=RUN_ID, role="head_call")[calls_before:]
     if not calls:
         return
     icon = {"claude": "🟠", "codex": "🔵", "judge": "⚖", "compact": "⧉"}
     parts = [f"{icon.get(c.get('head'), '·')} {c.get('secs', 0):.1f}s" + ("" if c.get("ok") else " ✗")
              for c in calls]
-    delta = _spent() - spent_before
-    console.print(f"[dim]{'  ·  '.join(parts)}{f'  ·  ${delta:.2f}' if delta >= 0.005 else ''}[/]")
+    spent = _spent()
+    delta = spent - spent_before
+    over = (f"  ·  [red]⚠ over budget (${spent:.2f} > ${cfg.ask_budget_usd:.2f})[/red]"
+            if cfg.ask_budget_usd and spent > cfg.ask_budget_usd else "")
+    console.print(f"[dim]{'  ·  '.join(parts)}{f'  ·  ${delta:.2f}' if delta >= 0.005 else ''}{over}[/]")
 
 
 def _make_prompt(renderer, cfg: Config, console: Console) -> Callable[[], str]:

@@ -45,6 +45,21 @@ def kill_inflight() -> None:
             pass
 
 
+def _classify(exc: Exception) -> str:
+    """transient = the world was flaky (a retry may help); permanent = WE are wrong
+    (bad flag, bad auth — fail fast, retrying is just failing slowly). _run folds the
+    stderr tail into the RuntimeError message, so text-matching str(exc) sees it.
+    A timeout counts as transient: retrying costs another head_timeout wait, but a
+    stalled network call is exactly the failure a second try tends to clear."""
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "transient"
+    msg = str(exc).lower()
+    if any(m in msg for m in ("429", "rate limit", "quota", "overloaded",
+                              "529", "503", "connection", "timed out")):
+        return "transient"
+    return "permanent"
+
+
 def proposer(message: str, cfg: Config) -> str:
     """Claude head — the REAL `claude` CLI, headless, NO tools.
     Prompt goes via STDIN: `--allowedTools` is variadic and eats a trailing positional

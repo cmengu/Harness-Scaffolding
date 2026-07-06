@@ -13,6 +13,9 @@ dependencies = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 council = "council.cli:main"
 
@@ -21,3 +24,6 @@ packages = ["council", "council.wrap"]
 
 [tool.setuptools.dynamic]
 version = { attr = "council.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

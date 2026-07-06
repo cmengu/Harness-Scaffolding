@@ -1,0 +1,6 @@
+#!/bin/sh
+# Always fails like a rate-limited provider: transient class, retries burn out.
+cat > /dev/null
+[ -n "$COUNCIL_STUB_COUNT" ] && echo x >> "$COUNCIL_STUB_COUNT"
+echo "429 rate limit exceeded" >&2
+exit 1

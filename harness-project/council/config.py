@@ -35,6 +35,9 @@ class Config:
     submit_retry_interval: float = 1.0  # re-send Enter this often while the H2 receipt is missing
     boot_probe: bool = False         # D3: spend one turn at launch proving the H2 receipt loop works
     history_turns: int = 6           # ask-mode memory: past turns carried in the ledger preamble
+    head_retries: int = 2            # attempts AFTER the first try — spent on TRANSIENT failures only
+    retry_base_delay: float = 1.0    # backoff between attempts: 1s → 2s → 4s
+    ask_budget_usd: float = 0.0      # ask-mode budget; > 0 = red nag in the turn receipt once crossed
     judge_style: str | None = None   # interactive-loop judge STYLE: None | 'moderator' | 'reasoning'
     # Ask-mode head overrides (/model · /effort flip these live). None = the CLI's own default.
     claude_model: str | None = None

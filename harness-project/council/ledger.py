@@ -42,6 +42,35 @@ def record(event: dict) -> None:
             os.close(fd)
 
 
+def quarantine(head: str, exc: Exception, context: dict) -> "os.PathLike":
+    """A readable corpse for a head that stayed dead after retries (further_steps 3c) —
+    a flaky-API day should yield a folder of postmortems, not silent gaps. Persistence,
+    so it lives here with the same privacy stance as the ledger: the postmortem carries
+    full prompt text → dir 0700, file 0600."""
+    from pathlib import Path
+    qdir: Path = _cfg().ledger_path.parent / "quarantine"
+    qdir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(qdir, 0o700)                    # repair a dir born under an older umask
+    path = qdir / (f"{time.strftime('%Y%m%d-%H%M%S')}-{RUN_ID}-{head}"
+                   f"-{uuid.uuid4().hex[:4]}.md")   # suffix: two failures in one second must not overwrite
+    path.write_text(f"""# head failure: {head}
+run: {RUN_ID}   when: {time.ctime()}   class: {context.get('kind', '?')}   attempts: {context.get('attempts', '?')}
+
+## what was asked (first 500 chars)
+{str(context.get('question', ''))[:500]}
+
+## what the error said
+{str(exc)[-2000:]}
+
+## what to do
+transient → the world was flaky; rerun when the provider recovers.
+permanent → the command is wrong; check the argv above against the CLI's --help.
+""")
+    os.chmod(path, 0o600)
+    record({"role": "quarantined", "head": head, "kind": context.get("kind"), "path": str(path)})
+    return path
+
+
 def trace(**filters) -> list[dict]:
     """The only reader (history-replay + the live viewer tail this). NB: this 'resume' means
     council re-reading its OWN ledger — NOT 'code --resume', which is Claude Code's session resume."""

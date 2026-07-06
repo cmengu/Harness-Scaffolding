@@ -1,5 +1,7 @@
 # council
 
+![ci](https://github.com/cmengu/Harness-Scaffolding/actions/workflows/ci.yml/badge.svg)
+
 Think and code with a **cross-family second opinion**. `council` is a thin harness that
 wraps the real Claude Code binary and can summon an OpenAI Codex adversary on demand —
 Claude proposes, Codex critiques, you decide.
@@ -11,6 +13,10 @@ Two modes, one ledger:
 | `council ask` | **THINK** — chat with Claude; toggle `/duel` to make Codex challenge each answer (`claude -p` vs `codex exec`) |
 | `council code` | **CODE** — a branded front over the *real* `claude` binary, hidden in tmux; your `~/.claude` hooks and settings stay live |
 | `council attach` | reconnect to a live code session — after a `/detach` or a crashed wrapper — with the whole conversation repainted |
+| `council shadow` | the understudy: one question under your current config (arm A) and current-plus-overrides (arm B), answers side by side |
+
+Duel fan-outs run both heads concurrently — **~1.5× faster than serial** measured across
+real duels (the two heads rarely take equal time; equal-length heads approach 2×).
 
 Every turn from both modes is appended to a single JSONL ledger, so debates and coding
 sessions share one provenance trail. Ask-mode conversations are durable *because* of that:
@@ -76,7 +82,10 @@ claude_model = ""           # ask-mode model overrides ("" = each CLI's default;
 codex_model = ""
 codex_effort = ""           # codex reasoning effort: minimal·low·medium·high (/effort)
 code_budget_usd = 0.0       # code-mode budget; > 0 = ask at each crossed multiple (0 = off)
+ask_budget_usd = 0.0        # ask-mode budget; > 0 = red nag in the turn receipt once crossed
 head_timeout = 300          # per-head subprocess timeout, s
+head_retries = 2            # extra attempts on TRANSIENT head failures (429/quota/connection)
+retry_base_delay = 1.0      # backoff between attempts: 1s → 2s → 4s
 turn_timeout = 600          # max wait for a code-mode turn
 submit_timeout = 10         # max wait for a delivery receipt before failing loud
 submit_retry_interval = 1.0 # re-send Enter this often while the receipt is missing
@@ -90,11 +99,35 @@ proposer = "claude"
 adversary = "codex"
 ```
 
+## Failure semantics
+
+A head failing must never kill a debate. Transient failures (429 / rate limit / quota /
+connection resets / timeouts) are retried with exponential backoff (`head_retries`,
+`retry_base_delay`); permanent ones (bad flag, bad auth) fail fast — retrying those is
+just failing slowly. A head that stays dead degrades the turn to single-voice and leaves
+a **quarantine postmortem** (`~/.council/quarantine/*.md`): what was asked, what the error
+said, and whether rerunning is worth it. `council report` shows the failure and retry
+rates; `council show <run-id>` replays any run including what went wrong.
+
+## Testing
+
+```sh
+pip install -e "harness-project[dev]"
+cd harness-project && pytest -q
+```
+
+The suite runs the entire debate loop against **stub heads** (`tests/stubs/`) — shell
+scripts that impersonate `claude -p` and `codex exec`, including rate-limited, hung, and
+flaky-once variants. No API keys, no network, no cost; CI runs the same suite on every
+push. **No secrets live in this repo** — credentials stay inside the `claude`/`codex`
+CLIs themselves.
+
 ## Privacy
 
 `~/.council/ledger.jsonl` stores the **full text of your conversations** (both modes).
 It is created owner-only (0600), but treat it like a shell history file: don't commit it,
-don't share it casually.
+don't share it casually. Quarantine postmortems carry prompt text too, so they get the
+same owner-only treatment.
 
 ## Attribution
 

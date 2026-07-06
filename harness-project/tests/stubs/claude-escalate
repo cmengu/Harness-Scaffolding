@@ -1,0 +1,4 @@
+#!/bin/sh
+# A reasoning judge that refuses to pick — exercises DebateResult.escalated.
+cat > /dev/null
+echo '{"result": "ESCALATE: neither answer is adequately supported.", "total_cost_usd": 0.0}'
