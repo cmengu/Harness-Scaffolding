@@ -13,9 +13,9 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from .backends import adversary, proposer
+from .backends import Cancelled, adversary, kill_inflight, proposer
 from .config import Config
-from .ledger import record, trace
+from .ledger import chain_rows, record
 
 
 @dataclass
@@ -56,14 +56,22 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
 
 
 def _both(msg_a, msg_b, cfg, console):
-    """Both heads concurrently with a live 🟠/🔵 status (block-then-present; columns can't stream-interleave)."""
+    """Both heads concurrently with a live 🟠/🔵 status (block-then-present; columns can't
+    stream-interleave). ^C here lands in the MAIN thread (this spinner loop) while the heads
+    run in workers — kill the subprocesses FIRST (their communicate() unblocks, each worker
+    finishes via _safe's Cancelled branch), THEN re-raise; otherwise pool.__exit__ blocks
+    forever waiting on workers stuck in communicate()."""
     with ThreadPoolExecutor(max_workers=2) as pool:
-        fa = pool.submit(_safe, proposer, msg_a, cfg, "claude")
-        fb = pool.submit(_safe, adversary, msg_b, cfg, "codex")
-        with Live(_status(fa, fb), console=console, refresh_per_second=8) as live:
-            while not (fa.done() and fb.done()):
-                wait([fa, fb], timeout=0.15)
-                live.update(_status(fa, fb))
+        try:
+            fa = pool.submit(_safe, proposer, msg_a, cfg, "claude")
+            fb = pool.submit(_safe, adversary, msg_b, cfg, "codex")
+            with Live(_status(fa, fb), console=console, refresh_per_second=8) as live:
+                while not (fa.done() and fb.done()):
+                    wait([fa, fb], timeout=0.15)
+                    live.update(_status(fa, fb))
+        except KeyboardInterrupt:
+            kill_inflight()
+            raise
         return fa.result(), fb.result()
 
 
@@ -79,6 +87,10 @@ def _safe(fn, msg, cfg, label):
         record({"role": "head_call", "head": label, "ok": True,
                 "secs": round(time.monotonic() - t0, 2)})
         return out
+    except Cancelled:                       # user's ^C, not a failure: no head_error row (replay
+        record({"role": "head_call", "head": label, "ok": False, "cancelled": True,
+                "secs": round(time.monotonic() - t0, 2)})   # stays clean), /report skips it
+        return f"_({label} cancelled)_"
     except Exception as e:
         record({"role": "head_call", "head": label, "ok": False,
                 "secs": round(time.monotonic() - t0, 2), "error": str(e)[:500]})
@@ -96,7 +108,7 @@ _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # wall-clock indexed so redraws fr
 def _status(fa, fb):
     spin = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
     mark = lambda f: "✓" if f.done() else f"{spin} thinking"
-    return f"🟠 claude {mark(fa)}    🔵 codex {mark(fb)}"
+    return f"🟠 claude {mark(fa)}    🔵 codex {mark(fb)}    [dim]^C cancels[/]"
 
 
 def _present(console, a, b):
@@ -137,26 +149,39 @@ def _synthesize(question, r, *, style, cfg, console):
     return r
 
 
+def _chain_turns() -> tuple[str | None, list[str]]:
+    """The active chain flattened to preamble-shaped turn strings (+ its /compact summary).
+    Shared by the preamble (slices + caps), /context (measures), /compact (summarizes ALL).
+    A question only becomes history once ANSWERED: a user row is held until a debate row
+    lands after it — so the current question (recorded before handle() runs) and cancelled
+    turns never echo back as fake memory. The `"proposer" in r` guard keeps event rows
+    (converged/cancelled markers share role=debate) from injecting empty CLAUDE: turns."""
+    summary, rows = chain_rows()
+    turns, pending = [], None
+    for r in rows:
+        if r.get("role") == "user":
+            pending = f"USER: {r['text']}"
+        elif r.get("role") == "debate" and r.get("round") is not None and "proposer" in r:
+            if pending:
+                turns.append(pending)
+                pending = None
+            turns.append(f"CLAUDE: {str(r.get('proposer', ''))[:800]}"
+                         + (f"\nCODEX: {str(r['adversary'])[:800]}" if r.get("adversary") else ""))
+    return summary, turns
+
+
 def _history_preamble(cfg: Config) -> str:
     """Ask-mode MEMORY. Heads are stateless subprocesses (`claude -p` / `codex exec` die per call),
     so council rebuilds context every turn from the ledger. This preamble is the ONLY memory the
     codex head has; it also lets a mid-conversation `/duel on` hand codex the whole back-story.
-    Scoped to THIS session: only rows after the latest session_start (else a fresh `council ask`
-    would 'remember' last week). Truncated hard — each turn ships this to up to 2 heads × N rounds."""
-    rows = trace()
-    starts = [i for i, r in enumerate(rows) if r.get("role") == "session_start"]
-    rows = rows[starts[-1] + 1:] if starts else rows
-    turns = []
-    for r in rows:
-        if r.get("role") == "user":
-            turns.append(f"USER: {r['text']}")
-        elif r.get("role") == "debate" and r.get("round") is not None:
-            turns.append(f"CLAUDE: {str(r.get('proposer', ''))[:800]}"
-                         + (f"\nCODEX: {str(r['adversary'])[:800]}" if r.get("adversary") else ""))
-    if rows and rows[-1].get("role") == "user":
-        turns.pop()          # the loop records the CURRENT question before handle() runs — don't
-                             # echo it back as "history"; it arrives as the question itself
+    Scope = the ACTIVE CHAIN (ledger.chain_rows): this session plus whatever /switch·/fork spliced
+    in front of it; a /compact summary caps the chain and leads the preamble. Truncated hard —
+    each turn ships this to up to 2 heads × N rounds."""
+    summary, turns = _chain_turns()
     text = "\n\n".join(turns[-cfg.history_turns * 2:])[-8000:]   # last N turns, ~8k char cap
+    if summary:
+        text = (f"Summary of the conversation so far (from a /compact):\n{summary.strip()[:4000]}"
+                + (f"\n\n{text}" if text else ""))
     return f"Conversation so far (context — do not re-answer old turns):\n{text}\n\n---\n\n" if text else ""
 
 
@@ -172,7 +197,7 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
     def handle(self, user_input: str) -> None:
         pre = _history_preamble(self.cfg)                       # both branches get the same memory
         if not self.adversarial:                                # SOLO: claude only, with memory
-            with self.console.status("[dim]🟠 claude thinking…[/]", spinner="dots"):
+            with self.console.status("[dim]🟠 claude thinking… (^C cancels)[/]", spinner="dots"):
                 out = _safe(proposer, pre + user_input, self.cfg, "claude")
             record({"role": "debate", "round": 0, "proposer": out, "adversary": None})
             self.console.print(f"[orange1]## 🟠 Claude[/]\n{out}")

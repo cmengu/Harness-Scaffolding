@@ -50,3 +50,58 @@ def trace(**filters) -> list[dict]:
         return []
     rows = (json.loads(l) for l in path.read_text().splitlines() if l.strip())
     return [r for r in rows if all(r.get(k) == v for k, v in filters.items())]
+
+
+# ── the session chain (G2 continuity: /switch · /fork · /compact) ──────────────────
+# A "conversation" stays what it always was — the rows between session_start markers,
+# anchored on the LAST marker. Continuity is one extra field: a session_start carrying
+# resumes=<sid> splices an older session's turns in front of its own. Append-only
+# storage never rewrites history; moving around it = appending one pointer row.
+
+def start_session(**extra) -> str:
+    """Open a session (memory boundary) and return its id. Extra fields thread the chain:
+    resumes=<sid> continues an older session · summary=<text> replaces one (/compact) ·
+    title=<str> names a fork. None values are dropped so bare calls stay bare rows."""
+    sid = uuid.uuid4().hex[:12]
+    record({"role": "session_start", "session_id": sid,
+            **{k: v for k, v in extra.items() if v is not None}})
+    return sid
+
+
+def _sid(row: dict) -> str:
+    """A session_start row's identity. Rows born before session ids get a stable one
+    derived from their timestamp, so old ledgers stay listable and resumable."""
+    return row.get("session_id") or f"ts{int(row.get('ts', 0) * 1000)}"
+
+
+def sessions() -> list[dict]:
+    """Every session in file order: {sid, start, rows} — rows run to the next
+    session_start regardless of run_id (the file IS the timeline, runs interleave)."""
+    all_rows = trace()
+    starts = [i for i, r in enumerate(all_rows) if r.get("role") == "session_start"]
+    out = []
+    for j, i in enumerate(starts):
+        end = starts[j + 1] if j + 1 < len(starts) else len(all_rows)
+        out.append({"sid": _sid(all_rows[i]), "start": all_rows[i], "rows": all_rows[i + 1:end]})
+    return out
+
+
+def chain_rows() -> tuple[str | None, list[dict]]:
+    """The ACTIVE conversation: the last session_start plus its `resumes` ancestry.
+    Returns (summary, rows) — rows chronological across the whole chain; summary = the
+    text a /compact left at the chain's end (None otherwise). Hop cap + seen-set keep a
+    hand-edited cycle from spinning; a missing ancestor just ends the chain early."""
+    segs = sessions()
+    if not segs:
+        return None, []
+    by_sid = {s["sid"]: s for s in segs}
+    chain, seen = [segs[-1]], {segs[-1]["sid"]}
+    while len(chain) < 10:
+        nxt = chain[-1]["start"].get("resumes")
+        if not nxt or nxt not in by_sid or nxt in seen:
+            break
+        chain.append(by_sid[nxt])
+        seen.add(nxt)
+    chain.reverse()                                   # oldest first
+    summary = chain[0]["start"].get("summary")        # a /compact row is always a chain END
+    return summary, [r for seg in chain for r in seg["rows"]]

@@ -10,9 +10,15 @@ Two modes, one ledger:
 |---|---|
 | `council ask` | **THINK** — chat with Claude; toggle `/duel` to make Codex challenge each answer (`claude -p` vs `codex exec`) |
 | `council code` | **CODE** — a branded front over the *real* `claude` binary, hidden in tmux; your `~/.claude` hooks and settings stay live |
+| `council attach` | reconnect to a live code session — after a `/detach` or a crashed wrapper — with the whole conversation repainted |
 
 Every turn from both modes is appended to a single JSONL ledger, so debates and coding
-sessions share one provenance trail.
+sessions share one provenance trail. Ask-mode conversations are durable *because* of that:
+`/switch` lists and resumes past conversations (across processes), `/fork` branches one,
+`/compact` folds a long thread into a summary and keeps going, `/history` and `/context`
+show exactly what the heads remember and how close to the cap it is. `/model` and `/effort`
+re-point a head mid-session, and `^C` cancels a turn in flight without killing the REPL —
+`/help` lists everything.
 
 ## Install
 
@@ -41,12 +47,35 @@ through two verified channels:
 Council's hooks are passed via `--settings` and *stack* with whatever is already registered
 in `~/.claude` — your existing setup keeps working underneath.
 
+Three safety/lifecycle layers ride those hooks:
+
+- **Permission relay** — when the hidden claude stops on a permission prompt (its own, or
+  one raised by council's blast-radius gate), council shows the prompt text and forwards
+  your answer (`1`/`2`/`y`/`esc`) as raw keystrokes. Previously this state was a dead-end
+  stall.
+- **Budget checkpoints** — set `code_budget_usd` and the PreToolUse gate asks (through
+  claude's own permission prompt) each time the session's running cost crosses another
+  multiple, stopping a runaway agentic loop at the next tool boundary. Approving a
+  checkpoint silences it; the next multiple asks again.
+- **Approval memory** — approving a gated command once (evidenced by the tool actually
+  running) silences that *exact* command for the rest of the session. Session-scoped by
+  construction: the memory file lives in the per-session bridge dir and dies with it.
+  Auto-allowed calls are printed (`⚑`) and ledgered, never silent.
+
+`/detach` leaves the hidden claude running and returns your terminal; `council attach`
+lists live sessions and reconnects (dead session litter is pruned as it lists).
+
 ## Configuration
 
 `~/.council/config.toml` (all optional; `COUNCIL_*` env vars override):
 
 ```toml
 rounds = 1                  # debate rounds per duel
+history_turns = 6           # ask-mode memory: past turns carried into each head call
+claude_model = ""           # ask-mode model overrides ("" = each CLI's default; /model flips live)
+codex_model = ""
+codex_effort = ""           # codex reasoning effort: minimal·low·medium·high (/effort)
+code_budget_usd = 0.0       # code-mode budget; > 0 = ask at each crossed multiple (0 = off)
 head_timeout = 300          # per-head subprocess timeout, s
 turn_timeout = 600          # max wait for a code-mode turn
 submit_timeout = 10         # max wait for a delivery receipt before failing loud
@@ -79,5 +108,7 @@ not distributed here.
 - Pane screen-scraping is **demoted to advisory** — the hook receipt is the sole delivery
   oracle; the scrape will be deleted once the disagreement log stays empty in real use.
 - `council review` (cross-family code review) is documented future work, cut from v1.
-- The `PermissionRequest` hook (surfacing hidden permission prompts) is wired but not yet
-  verified against a live session.
+- The `PermissionRequest` hook event name is still **unverified against a live session**.
+  The permission relay, budget checkpoints, and approval memory all degrade gracefully if
+  it never fires (back to the stall-warning world), but the first live `council code` run
+  should confirm the event actually arrives.

@@ -22,7 +22,7 @@ from pathlib import Path
 from ..config import Config
 from ..ledger import record
 from .bridge import (draft_lingering, inject, kill_session, launch_claude_in_tmux,
-                     pane_alive, pane_tail, press_enter, write_hook_settings)
+                     pane_alive, pane_tail, press_enter, send_keys, write_hook_settings)
 from .bridge import prepare_bridge_dir
 from .events import read_events
 from .render import Renderer
@@ -65,20 +65,19 @@ class SessionState:
             if m["event"] == "UserPromptSubmit":
                 self.last_submit_ts = m["ts"]
 
-    def wait_idle(self, timeout: float, on_blocked=None) -> bool:
-        """True = idle; False = timed out (backstop — never hang).
-        on_blocked fires ONCE if a D2 permission-wait marker shows up mid-wait."""
+    def wait_idle(self, timeout: float) -> str:
+        """Wait for the turn to end. Returns "idle" | "blocked" | "timeout".
+        "blocked" returns IMMEDIATELY (a D2 permission-wait marker showed up): the pump
+        owns the response — show the prompt, forward an answer — not a callback here."""
         deadline = time.monotonic() + timeout
-        announced = False
         while time.monotonic() < deadline:
             self.poll()
             if not self.busy:
-                return True
-            if self.blocked and on_blocked and not announced:
-                on_blocked()
-                announced = True
+                return "idle"
+            if self.blocked:
+                return "blocked"
             time.sleep(0.05)
-        return False
+        return "timeout"
 
     def wait_submitted(self, since_ts: float, timeout: float) -> bool:
         """H2's oracle. Keys on last_submit_ts (NOT .busy) so a turn fast enough to Stop
@@ -126,22 +125,53 @@ def _inject_confirmed(bridge: Path, text: str, state: SessionState, renderer, cf
             "pane_tail": pane_tail(bridge)})
 
 
+# ── D2 answered — the permission relay ────────────────────────────────────────
+
+def _answer_permission(bridge: Path, renderer, state: SessionState) -> None:
+    """The hidden pane is showing a permission prompt (a menu the user can't see).
+    Show claude's own prompt text, forward ONE answer verbatim, and optimistically
+    clear the blocked flag: no marker fires when a prompt is ANSWERED (PermissionRequest
+    only fires when one OPENS), so waiting for a clearing marker would re-prompt forever.
+    A wrong keystroke degrades to the stall path — which now shows the pane tail."""
+    renderer.console.rule("[yellow]⛔ permission — the hidden claude is asking[/]",
+                          style="yellow", align="left")
+    renderer.console.print(pane_tail(bridge) or "[dim](could not capture the prompt)[/]")
+    try:
+        ans = renderer.console.input("[bold yellow]answer (1/2/y/esc/enter) ›[/] ").strip()
+    except (EOFError, KeyboardInterrupt):
+        renderer.notice("left unanswered — the prompt stays up; the stall check takes over")
+        state.blocked = False
+        return
+    try:
+        send_keys(bridge, ans)
+    except RuntimeError as exc:
+        renderer.error(f"⚠ could not reach the pane: {exc}")
+    record({"role": "code_permission", "answer": ans})
+    state.blocked = False
+
+
 # ── H1d — the input pump, gated on idle ───────────────────────────────────────
 
-def _input_pump(bridge: Path, renderer, state: SessionState, cfg: Config) -> None:
+def _input_pump(bridge: Path, renderer, state: SessionState, cfg: Config) -> str:
+    """Returns why it stopped: "exit" (kill the hidden claude) | "detach" (leave it
+    running — `council attach` reconnects)."""
     stalls = 0                # the happy path depends on Stop ARRIVING; bound the wait
-    warn_blocked = lambda: renderer.error(       # D2: a hidden permission prompt looks like a hang
-        "⚠ hidden claude is waiting on a PERMISSION prompt council can't answer — "
-        "it will sit until the turn stalls (consider --permission-mode or pre-allowed tools)")
     while True:
-        if not state.wait_idle(timeout=cfg.turn_timeout, on_blocked=warn_blocked):
+        outcome = state.wait_idle(timeout=cfg.turn_timeout)
+        if outcome == "blocked":
+            _answer_permission(bridge, renderer, state)       # D2: answer it, don't just warn
+            continue
+        if outcome == "timeout":
             stalls += 1
             if stalls >= 2:                                   # 2× turn_timeout with no event
                 if not pane_alive(bridge):                    # ground truth
                     renderer.error("hidden claude died — session over")
-                    return
+                    return "exit"
                 renderer.error(f"no Stop event in {stalls * cfg.turn_timeout}s — "
                                "unlocking input (interlock degraded)")
+                tail = pane_tail(bridge)                      # a lingering unanswered
+                if tail:                                      # permission prompt shows HERE
+                    renderer.notice(f"pane tail:\n{tail}")
                 state.busy = False    # manual override: worst case = the pre-H1 world
             else:
                 renderer.notice("Claude still working…")
@@ -149,13 +179,15 @@ def _input_pump(bridge: Path, renderer, state: SessionState, cfg: Config) -> Non
         stalls = 0
         if not pane_alive(bridge):
             renderer.notice("session ended")
-            return
+            return "exit"
         try:
             text = renderer.read_input()                      # box is live only now
         except (EOFError, KeyboardInterrupt):
-            return
+            return "exit"
         if text in ("/exit", "/quit", "exit", "quit"):
-            return
+            return "exit"
+        if text == "/detach":
+            return "detach"
         if not text:
             continue
         _inject_confirmed(bridge, text, state, renderer, cfg)
@@ -202,25 +234,47 @@ def _preflight(command: str) -> None:
 
 def run_claude_session(*, claude_args, use_claude_config: bool, command: str,
                        resume: str | None, cfg: Config) -> None:
-    """The CODE engine. use_claude_config is HARDWIRED True by cli.py — the whole point
-    is that the real binary loads ~/.claude, so the-harness's hooks stay live."""
+    """The CODE engine, launch half. use_claude_config is HARDWIRED True by cli.py — the
+    whole point is that the real binary loads ~/.claude, so the-harness's hooks stay live."""
     _preflight(command)
     bridge = prepare_bridge_dir()
     save_launch_cwd(bridge, Path.cwd(), resume)
     write_hook_settings(bridge)                 # council's hooks STACK on ~/.claude's
     launch_claude_in_tmux(bridge, command=command, claude_args=tuple(claude_args), resume=resume)
     record({"role": "code_session", "event": "start", "bridge": str(bridge)})
-    renderer = Renderer(cfg, bridge)
-    renderer.notice(f"engine hidden in tmux (bridge {bridge.name}) — /exit to quit")
+    _attached_loop(bridge, cfg, fresh=True)
+
+
+def attach_claude_session(bridge: Path, cfg: Config) -> None:
+    """Reconnect to a live hidden claude (after /detach, or a crashed wrapper). The
+    transcript replays from byte 0 — the whole conversation repaints as history — then
+    the session goes live exactly as if never left."""
+    record({"role": "code_session", "event": "attach", "bridge": str(bridge)})
+    _attached_loop(bridge, cfg, fresh=False)
+
+
+def _attached_loop(bridge: Path, cfg: Config, *, fresh: bool) -> None:
+    """The shared attach half: renderer + state + the two pumps. `fresh` gates the boot
+    probe (an attach must not spend a turn) and puts the renderer in replay mode so
+    repainted history isn't re-recorded to the ledger."""
+    renderer = Renderer(cfg, bridge, replaying=not fresh)   # attach repaints history dim
+    renderer.notice(f"engine hidden in tmux (bridge {bridge.name}) — /exit to quit · /detach to leave it running")
     state = SessionState(bridge)
-    out = threading.Thread(target=lambda: [renderer.handle(e) for e in read_events(bridge)],
+    out = threading.Thread(target=lambda: [renderer.handle(e)
+                                           for e in read_events(bridge, fresh=fresh)],
                            daemon=True)
-    out.start()                                 # pump 1: claude's 3 channels → council's skin
+    out.start()                                 # pump 1: claude's 4 channels → council's skin
+    why = "exit"
     try:
-        if cfg.boot_probe:
+        if fresh and cfg.boot_probe:
             _boot_probe(bridge, state, renderer, cfg)   # D3: fail at boot, not mid-conversation
-        _input_pump(bridge, renderer, state, cfg)   # pump 2: council's box → the hidden pane
+        why = _input_pump(bridge, renderer, state, cfg)  # pump 2: council's box → the hidden pane
     finally:
-        kill_session(bridge)                    # never leave a hidden claude running
-        record({"role": "code_session", "event": "end"})
-        renderer.console.print("\n[bold]⚖ council code session ended[/]")
+        if why == "detach":
+            record({"role": "code_session", "event": "detach"})
+            renderer.console.print(f"\n[bold]⚖ detached[/] — hidden claude keeps running · "
+                                   f"[dim]council attach {bridge.name}[/] to return")
+        else:
+            kill_session(bridge)                # never leave a hidden claude running on EXIT
+            record({"role": "code_session", "event": "end"})
+            renderer.console.print("\n[bold]⚖ council code session ended[/]")

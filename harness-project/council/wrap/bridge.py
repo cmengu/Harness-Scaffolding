@@ -17,6 +17,7 @@ import contextlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -102,6 +103,10 @@ def write_hook_settings(bridge: Path) -> None:
             "MessageDisplay": [{"hooks": [{"type": "command",
                 "command": f"{env} {py} -m council.wrap.display_hook {b}"}]}],
             "PreToolUse":     [{"hooks": [{"type": "command",
+                "command": f"{env} {py} -m council.wrap.harness_status {b}"}]}],
+            # Approval evidence: a gated tool that RAN means the user said yes — PostToolUse
+            # promotes the pending ask to a remembered approval (same module, event-dispatched).
+            "PostToolUse":    [{"hooks": [{"type": "command",
                 "command": f"{env} {py} -m council.wrap.harness_status {b}"}]}],
             # H1: the busy/idle interlock — one command wired to three turn-boundary events
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": state_cmd}]}],
@@ -221,6 +226,48 @@ def press_enter(bridge: Path) -> None:
     so a retry racing a slow receipt is safe."""
     info = _wait_for_tmux_info(bridge, timeout_s=0.2)
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+
+
+# Named answers → tmux key names for the permission answer path.
+_ANSWER_KEYS = {"": "Enter", "enter": "Enter", "esc": "Escape", "escape": "Escape",
+                "up": "Up", "down": "Down", "tab": "Tab"}
+
+
+def send_keys(bridge: Path, answer: str) -> None:
+    """Forward ONE permission-prompt answer to the hidden pane (the D2 answer path).
+    NOT inject(): that targets the input BOX (bracketed paste + needle verification);
+    a permission prompt is a MENU — it wants raw keystrokes and there is no receipt
+    to verify against. Named keys map to tmux key names; a single character goes
+    literally WITHOUT Enter (claude's numbered menus act on the digit immediately —
+    a trailing Enter would land on the next UI state); longer text gets Enter."""
+    info = _wait_for_tmux_info(bridge, timeout_s=0.2)
+    ans = answer.strip()
+    key = _ANSWER_KEYS.get(ans.lower())
+    if key is not None:
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], key)
+        return
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "-l", ans)
+    if len(ans) > 1:
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Enter")
+
+
+def list_bridges(prune: bool = True) -> list[Path]:
+    """Every LIVE bridge dir under /tmp/council-<uid>/, newest first (the `attach`
+    surface). A live pane with no council attached = a /detach or a crashed wrapper —
+    exactly what attach exists for. Dead dirs are pruned by default: they are ours,
+    session-scoped, and only ever litter once the pane is gone."""
+    root = Path(tempfile.gettempdir()) / f"council-{os.getuid()}"
+    if not root.is_dir():
+        return []
+    live: list[Path] = []
+    for d in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not d.is_dir():
+            continue
+        if pane_alive(d):
+            live.append(d)
+        elif prune:
+            shutil.rmtree(d, ignore_errors=True)
+    return live
 
 
 def draft_lingering(bridge: Path, needle: str) -> bool:

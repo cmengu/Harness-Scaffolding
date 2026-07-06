@@ -36,6 +36,12 @@ class Config:
     boot_probe: bool = False         # D3: spend one turn at launch proving the H2 receipt loop works
     history_turns: int = 6           # ask-mode memory: past turns carried in the ledger preamble
     judge_style: str | None = None   # interactive-loop judge STYLE: None | 'moderator' | 'reasoning'
+    # Ask-mode head overrides (/model · /effort flip these live). None = the CLI's own default.
+    claude_model: str | None = None
+    codex_model: str | None = None
+    codex_effort: str | None = None  # codex -c model_reasoning_effort: minimal·low·medium·high
+    code_budget_usd: float = 0.0     # code-mode session budget; 0 = off. The PreToolUse gate
+                                     # ASKs at each crossed multiple (checkpoint ladder).
     # Theme — the banner/prompt skin. GENERIC defaults on purpose: the public repo stays
     # unbranded; a private skin (name, accent, mascot) lives in ~/.council/config.toml only.
     banner_title: str = "COUNCIL"

@@ -21,6 +21,7 @@ def render_banner(console: Console, cfg: Config, mode: str) -> None:
         "ask":    f"think · {cfg.heads.proposer} · /duel summons {cfg.heads.adversary}"
                   + (f" · judge:{cfg.heads.judge}" if cfg.heads.judge else ""),
         "code":   "code · Claude Code + the-harness  (hidden engine)",
+        "attach": "code · reattached to a running hidden engine",
     }[mode]   # ("review" cut from v1 — G6)
     info = Text.assemble(
         (subtitle + "\n", "cyan"),

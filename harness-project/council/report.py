@@ -24,7 +24,7 @@ def summary(days: int = 7):
         runs.setdefault(r.get("run_id", "pre-run-id"), []).append(r)
 
     calls = [r for r in rows if r.get("role") == "head_call"]
-    fails = [c for c in calls if not c.get("ok")]
+    fails = [c for c in calls if not c.get("ok") and not c.get("cancelled")]   # a ^C isn't a failure
     lat = sorted(c.get("secs", 0.0) for c in calls if c.get("ok"))
     ask_usd = sum(r.get("usd") or 0.0 for r in rows if r.get("role") == "head_cost")
     # code-mode cost: statusLine's total_cost_usd is a RUNNING session total —
@@ -58,14 +58,23 @@ def replay(run_id: str, console: Console) -> None:
         ids = list(dict.fromkeys(r["run_id"] for r in trace() if r.get("run_id")))[-8:]
         console.print(f"[red]no rows for run {run_id!r}[/] — recent: " + (", ".join(ids) or "none"))
         return
-    from .debate import _present                     # lazy: replay is the only need here
     console.print(f"[bold]run {run_id}[/] · {_mode(rows)} · "
                   f"{time.strftime('%d %b %H:%M', time.localtime(rows[0].get('ts', 0)))}\n")
+    render_rows(rows, console)
+
+
+def render_rows(rows: list[dict], console: Console) -> None:
+    """One ledger row → its terminal form. Shared by replay (a whole run) and ask-mode
+    /history + /switch recap (the active chain). The `"proposer" in r` guard keeps event
+    rows (converged/cancelled share role=debate) from rendering as empty Claude blocks."""
+    from .debate import _present                     # lazy: avoids a module cycle at import
     for r in rows:
         role = r.get("role")
         if role in ("user", "code_user"):
             console.print(f"\n[bold]› {r.get('text', '')}[/]")
-        elif role == "debate" and r.get("round") is not None:
+        elif role == "debate" and r.get("event") == "cancelled":
+            console.print("[yellow]✗ turn cancelled[/]")
+        elif role == "debate" and r.get("round") is not None and "proposer" in r:
             if r.get("adversary"):
                 _present(console, str(r.get("proposer", "")), str(r["adversary"]))
             else:

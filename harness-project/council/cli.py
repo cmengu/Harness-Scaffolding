@@ -43,7 +43,8 @@ def ask(question, prompt, rounds, judge, duel):
     renderer = DebateRenderer(cfg, console, adversarial=duel)
     q = prompt or question
     if q:                                             # one-shot: answer once (solo or duel) and exit
-        record({"role": "session_start"})             # else _history_preamble inherits the PREVIOUS
+        from .ledger import start_session
+        start_session()                               # else _history_preamble inherits the PREVIOUS
         record({"role": "user", "text": q})           # session's tail as stale "memory"
         renderer.handle(q)
     else:
@@ -77,6 +78,50 @@ def code(resume, claude_command, claude_args):
 # `review` command: CUT from v1 (3 Jul 2026). It imported a `review.py` that never existed
 # (G6 defines launch.py + call-reviewer.sh instead) → guaranteed ImportError. Two-mode goal
 # = ask + code; the G6 section stays as documented future work.
+
+
+@cli.command()
+@click.argument("bridge_id", required=False)
+def attach(bridge_id):
+    """ATTACH — reconnect to a live code session (after /detach or a crashed wrapper)."""
+    if sys.platform == "win32":
+        raise click.ClickException("council attach needs a PTY (macOS/Linux).")
+    cfg = load_config()
+    from .wrap.bridge import list_bridges
+    from .wrap.state import read_launch_state
+    live = list_bridges()                       # dead bridge dirs are pruned as a side effect
+    if not live:
+        console.print("[dim]no running code sessions — start one with `council code`, "
+                      "leave it with /detach[/]")
+        return
+    if bridge_id:
+        hits = [b for b in live if b.name.startswith(bridge_id)]
+        if len(hits) != 1:
+            console.print(f"[red]{'ambiguous' if hits else 'unknown'} session {bridge_id!r}[/]"
+                          " — bare `council attach` lists them")
+            return
+        bridge = hits[0]
+    elif len(live) == 1:
+        bridge = live[0]
+    else:
+        import time as _time
+        from rich.table import Table
+        t = Table(title="live code sessions", padding=(0, 2))
+        for col in ("id", "started", "cwd"):
+            t.add_column(col, style="dim" if col == "started" else "")
+        for b in live:
+            launch = read_launch_state(b)
+            t.add_row(b.name,
+                      _time.strftime("%d %b %H:%M", _time.localtime(launch.get("launched_at", 0))),
+                      launch.get("cwd", "?"))
+        console.print(t)
+        console.print("[dim]council attach <id> to pick one[/]")
+        return
+    from .ledger import record as _record
+    _record({"role": "run_start", "mode": "code"})
+    render_banner(console, cfg, "attach")
+    from .wrap.session import attach_claude_session
+    attach_claude_session(bridge, cfg)
 
 
 @cli.command()

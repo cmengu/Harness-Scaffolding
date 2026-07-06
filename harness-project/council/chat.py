@@ -5,25 +5,33 @@ Input strip ↔ omnigent-ui-sdk terminal/_host.py (TerminalHost) — the SAME pr
 from __future__ import annotations
 
 import sys
+import time
 from typing import Callable, Protocol
 
 from rich.console import Console
 from rich.table import Table
 
 from .config import Config
-from .ledger import RUN_ID, record, trace
+from .ledger import RUN_ID, chain_rows, record, sessions, start_session, trace
 
 # One table drives /help AND the completion popup — they can never drift apart.
 _COMMANDS: list[tuple[str, str, str]] = [
     ("/duel", "[on|off]", "toggle the codex adversary (bare /duel flips it)"),
     ("/rounds", "N", "debate depth when duelling"),
     ("/judge", "<style>", "off · moderator · reasoning"),
+    ("/model", "[head name]", "per-head model override — /model claude opus · /model reset"),
+    ("/effort", "[level]", "codex reasoning effort: minimal·low·medium·high · reset"),
     ("/status", "", "adversary · rounds · judge · heads · session cost"),
     ("/cost", "", "what this session has spent so far"),
     ("/last", "", "reprint the previous answer / debate"),
+    ("/history", "", "everything the heads currently remember"),
+    ("/context", "", "memory size vs the cap (chars · turns · summary)"),
+    ("/compact", "", "squash memory into a summary, keep going"),
+    ("/switch", "[#|id]", "list past conversations · resume one"),
+    ("/fork", "[title]", "branch this conversation: same memory, new tangent"),
+    ("/new", "", "fresh memory boundary (history preamble resets)"),
     ("/report", "[days]", "runs · cost · latency · failures from the ledger"),
     ("/show", "<run-id>", "replay one run (IDs listed by /report)"),
-    ("/new", "", "fresh memory boundary (history preamble resets)"),
     ("/help", "", "all commands"),
     ("/exit", "", "leave"),
 ]
@@ -36,10 +44,13 @@ class Renderer(Protocol):
 
 
 def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
-    """Read → record → dispatch → render, until exit."""
-    record({"role": "session_start"})        # memory boundary: the history preamble (G2) only reads
-    read_input = _make_prompt(renderer, cfg, console)
-    try:                                     # ledger rows AFTER the latest session_start
+    """Read → record → dispatch → render, until exit. Two ^C behaviors, by where you are:
+    at the prompt it abandons the draft; mid-turn it CANCELS the turn (kills the head
+    subprocesses) and the unanswered question stays out of memory (_chain_turns holds a
+    question back until a debate row answers it)."""
+    start_session()                          # memory boundary: the history preamble (G2) only
+    read_input = _make_prompt(renderer, cfg, console)   # reads the chain from this row on
+    try:
         while True:
             try:
                 text = read_input().strip()
@@ -55,9 +66,31 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
             if not text:
                 continue
             record({"role": "user", "text": text})
-            renderer.handle(text)
+            calls_before = len(trace(run_id=RUN_ID, role="head_call"))
+            spent_before = _spent()
+            try:
+                renderer.handle(text)
+            except KeyboardInterrupt:
+                record({"role": "debate", "event": "cancelled"})
+                console.print("\n[yellow]✗ cancelled — answer discarded, question kept out of memory[/]")
+            else:
+                _turn_line(console, calls_before, spent_before)
     finally:
         _clear_title()
+
+
+def _turn_line(console: Console, calls_before: int, spent_before: float) -> None:
+    """One dim receipt after each turn: per-head seconds (✗ = that head failed) + the
+    turn's cost delta. Data is already in the ledger (head_call/head_cost) — this just
+    surfaces what /report aggregates, while the turn is still on screen."""
+    calls = trace(run_id=RUN_ID, role="head_call")[calls_before:]
+    if not calls:
+        return
+    icon = {"claude": "🟠", "codex": "🔵", "judge": "⚖", "compact": "⧉"}
+    parts = [f"{icon.get(c.get('head'), '·')} {c.get('secs', 0):.1f}s" + ("" if c.get("ok") else " ✗")
+             for c in calls]
+    delta = _spent() - spent_before
+    console.print(f"[dim]{'  ·  '.join(parts)}{f'  ·  ${delta:.2f}' if delta >= 0.005 else ''}[/]")
 
 
 def _make_prompt(renderer, cfg: Config, console: Console) -> Callable[[], str]:
@@ -111,8 +144,8 @@ def _slash(text: str, renderer, console: Console) -> None:
     if cmd == "/help":
         _help(cfg, console)
     elif cmd == "/new":
-        record({"role": "session_start"})    # fresh memory boundary, same process
-        console.print("— new session — history preamble reset —")
+        start_session()                      # fresh memory boundary, same process
+        console.print("— new session — history reset —  [dim](/switch brings the old one back)[/]")
     elif cmd == "/duel":
         import shutil
         renderer.adversarial = {"on": True, "off": False}.get(arg, not renderer.adversarial)
@@ -146,6 +179,20 @@ def _slash(text: str, renderer, console: Console) -> None:
         _cost(console)
     elif cmd == "/last":
         _last(console)
+    elif cmd == "/switch":
+        _switch(arg, console)
+    elif cmd == "/fork":
+        _fork(arg, console)
+    elif cmd == "/history":
+        _history(cfg, console)
+    elif cmd == "/model":
+        _model(arg, cfg, console)
+    elif cmd == "/effort":
+        _effort(arg, cfg, console)
+    elif cmd == "/context":
+        _context(cfg, console)
+    elif cmd == "/compact":
+        _compact(cfg, console)
     elif cmd == "/report":
         from .report import summary
         days = int(arg) if arg.isdigit() else 7
@@ -198,7 +245,9 @@ def _status(renderer, console: Console) -> None:
     t.add_row("rounds", str(cfg.rounds))
     t.add_row("judge", (cfg.judge_style or "off")
               + (f" · run by {cfg.heads.judge or 'claude'}" if cfg.judge_style else ""))
-    t.add_row("heads", f"{cfg.claude_command} · {cfg.codex_command}")
+    t.add_row("heads", f"{cfg.claude_command}{f' ({cfg.claude_model})' if cfg.claude_model else ''}"
+              f" · {cfg.codex_command}{f' ({cfg.codex_model})' if cfg.codex_model else ''}"
+              + (f" · effort {cfg.codex_effort}" if cfg.codex_effort else ""))
     t.add_row("memory", f"last {cfg.history_turns} turns from the ledger")
     t.add_row("session", f"{RUN_ID} · {_spent():.2f} USD so far")
     console.rule("[bold]status[/]", style=cfg.accent_color, align="left")
@@ -216,8 +265,10 @@ def _spent() -> float:
 
 
 def _last(console: Console) -> None:
-    """Reprint the previous turn — columns for a duel, one voice for solo, verdict if judged."""
-    turns = [r for r in trace(run_id=RUN_ID, role="debate") if r.get("round") is not None]
+    """Reprint the previous turn — columns for a duel, one voice for solo, verdict if judged.
+    The `"proposer" in r` guard skips event rows (converged/cancelled share role=debate)."""
+    turns = [r for r in trace(run_id=RUN_ID, role="debate")
+             if r.get("round") is not None and "proposer" in r]
     if not turns:
         console.print("[dim]nothing yet this session[/]")
         return
@@ -230,3 +281,206 @@ def _last(console: Console) -> None:
     judges = trace(run_id=RUN_ID, role="judge")
     if judges and judges[-1].get("ts", 0) > last.get("ts", 0):
         console.print(f"\n[bold]## ⚖ Synthesis[/] ({judges[-1].get('style')})\n{judges[-1].get('text', '')}")
+
+
+# ── conversation continuity: /switch · /fork · /history · /compact · /context ──────
+# The mechanism is ONE move: append a session_start row that `resumes` an older session
+# (ledger.start_session). /switch and /fork are the same row with different messaging;
+# /compact is the same row carrying a summary instead of a pointer. Append-only storage
+# never rewrites history — "moving around" it = appending one pointer row.
+
+def _session_index() -> list[dict]:
+    """Conversations worth listing: sessions with an ANSWERED turn (or a /compact summary —
+    that IS a conversation, condensed). Same answered-only rule as _chain_turns, so the
+    table never promises memory that resuming won't deliver (a lone cancelled question,
+    abandoned /new markers, bare launches — all hidden). Newest first, capped at 20."""
+    out = []
+    for seg in sessions():
+        answered, pending = [], None
+        for r in seg["rows"]:
+            if r.get("role") == "user":
+                pending = r["text"]
+            elif r.get("role") == "debate" and r.get("round") == 0 and "proposer" in r:
+                if pending is not None:
+                    answered.append(pending)
+                    pending = None
+        if not answered and not seg["start"].get("summary"):
+            continue
+        title = seg["start"].get("title") or (answered[0] if answered else "(compacted)")
+        out.append({"sid": seg["sid"], "ts": seg["start"].get("ts", 0),
+                    "turns": len(answered), "title": str(title)[:60]})
+    return out[::-1][:20]
+
+
+def _switch(arg: str, console: Console) -> None:
+    """No arg: the conversations table (↔ omnigent _repl.py:5195 — #·id·title·when shape).
+    With #/id: splice that conversation's history in front of a fresh session. Works across
+    processes for free — the ledger is one file, so a fresh `council ask` can /switch into
+    last week's thread."""
+    index = _session_index()
+    if not arg:
+        if not index:
+            console.print("[dim]no past conversations yet[/]")
+            return
+        t = Table(title="switch to…", padding=(0, 2))
+        for col in ("#", "id", "started", "turns", "title"):
+            t.add_column(col, style="dim" if col in ("id", "started") else "")
+        for i, s in enumerate(index, 1):
+            t.add_row(str(i), s["sid"], time.strftime("%d %b %H:%M", time.localtime(s["ts"])),
+                      str(s["turns"]), s["title"])
+        console.print(t)
+        console.print("[dim]/switch <#> or <id> to resume[/]")
+        return
+    if arg.isdigit():
+        i = int(arg) - 1
+        if not 0 <= i < len(index):
+            console.print(f"[red]no conversation #{arg}[/] — bare /switch lists {len(index)}")
+            return
+        target = index[i]
+    else:
+        hits = [s for s in index if s["sid"].startswith(arg)]
+        if len(hits) != 1:
+            console.print(f"[red]{'ambiguous' if hits else 'unknown'} id {arg!r}[/] — bare /switch lists them")
+            return
+        target = hits[0]
+    start_session(resumes=target["sid"])
+    console.print(f"↺ resumed [bold]{target['title']}[/]  [dim]({target['sid']} · {target['turns']} turn(s))[/]")
+    _recap(console)
+
+
+def _recap(console: Console) -> None:
+    """After a /switch: reprint the tail of what memory now holds, so the screen and the
+    heads agree on where the conversation stands (council's cheap _attach_to_conversation)."""
+    summary, rows = chain_rows()
+    if summary:
+        console.print(f"[dim]memory opens from a compact summary ({len(summary)} chars)[/]")
+    last_u = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].get("role") == "user"), None)
+    if last_u is None:
+        return
+    answers = [r for r in rows[last_u + 1:]
+               if r.get("role") == "debate" and r.get("round") is not None and "proposer" in r]
+    from .report import render_rows
+    render_rows([rows[last_u]] + answers[-1:], console)   # the question + its FINAL round
+
+
+def _fork(arg: str, console: Console) -> None:
+    """Branch: a new session resuming the CURRENT one — both share history up to here, new
+    turns diverge. Return-path message ↔ omnigent _repl.py:5455 (fork switches you in-place;
+    the old id is your way back)."""
+    segs = sessions()
+    if not segs:
+        console.print("[dim]nothing to fork yet — this is already a fresh conversation[/]")
+        return
+    old = segs[-1]["sid"]
+    title = arg.strip() or None
+    start_session(resumes=old, title=title)
+    console.print(f"⑂ forked{f' as [bold]{title}[/]' if title else ''} — same memory, new branch"
+                  f"  [dim](/switch {old} returns to the original)[/]")
+
+
+def _history(cfg: Config, console: Console) -> None:
+    """The full active chain, untruncated, in the overlay — truth-in-advertising for what
+    /switch·/fork·/compact left in memory. (The preamble additionally clips: last
+    history_turns×2 rows, 800 chars/voice, 8k total — /context shows those numbers.)"""
+    summary, rows = chain_rows()
+    if not rows and not summary:
+        console.print("[dim]nothing yet this conversation[/]")
+        return
+    from .report import render_rows
+
+    def body() -> None:
+        if summary:
+            console.rule("[bold]compact summary[/]", style="dim", align="left")
+            console.print(summary.strip())
+        render_rows(rows, console)
+    _view(console, cfg, "history — what the heads remember", body)
+
+
+def _model(arg: str, cfg: Config, console: Console) -> None:
+    """Per-head model override, next turn onward. Values ship VERBATIM — no catalog to
+    validate against, so warn-never-block (↔ omnigent _repl.py:4990): a wrong name fails
+    loud on the next turn and lands in the ledger as a head_call error."""
+    words = arg.split()
+    if not words:
+        console.print(f"claude: [bold]{cfg.claude_model or 'CLI default'}[/] · "
+                      f"codex: [bold]{cfg.codex_model or 'CLI default'}[/]"
+                      "  [dim](/model claude|codex <name> · /model reset)[/]")
+        return
+    if words[0] in ("reset", "off", "default"):
+        cfg.claude_model = cfg.codex_model = None
+        console.print("models reset — each CLI picks its own default again")
+        return
+    if len(words) == 2 and words[0] in ("claude", "codex"):
+        setattr(cfg, f"{words[0]}_model", words[1])
+        console.print(f"{words[0]} model = [bold]{words[1]}[/]  [dim](verbatim — a bad name fails"
+                      " on the next turn; /model reset undoes)[/]")
+        return
+    console.print("[red]usage: /model · /model claude|codex <name> · /model reset[/]")
+
+
+_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+def _effort(arg: str, cfg: Config, console: Console) -> None:
+    """Codex reasoning effort (`-c model_reasoning_effort=…`). Codex-only and says so —
+    claude -p has no effort knob (extended thinking is prompt-level, not a flag)."""
+    if not arg:
+        console.print(f"codex effort: [bold]{cfg.codex_effort or 'CLI default'}[/]"
+                      f"  [dim](/effort {'·'.join(_EFFORTS)} · reset — codex only)[/]")
+    elif arg in ("reset", "off", "default"):
+        cfg.codex_effort = None
+        console.print("codex effort reset to the CLI default")
+    elif arg in _EFFORTS:
+        cfg.codex_effort = arg
+        console.print(f"codex effort = [bold]{arg}[/]  [dim](claude unaffected — no such knob on claude -p)[/]")
+    else:
+        console.print(f"[red]usage: /effort {'|'.join(_EFFORTS)}|reset[/]")
+
+
+def _context(cfg: Config, console: Console) -> None:
+    """How full ask-mode memory is — measured off the REAL preamble the next turn ships,
+    not an estimate of one. Coin bar ↔ omnigent _repl.py:5516 (10 slots, block glyphs)."""
+    from .debate import _chain_turns, _history_preamble
+    summary, turns = _chain_turns()
+    if not turns and not summary:
+        console.print("[dim]memory is empty — nothing said yet this conversation[/]")
+        return
+    kept = turns[-cfg.history_turns * 2:]
+    turn_text = "\n\n".join(kept)[-8000:]
+    frac = len(turn_text) / 8000
+    bar = "█" * round(frac * 10) + "░" * (10 - round(frac * 10))
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_row("turn window", f"{bar}  {len(turn_text)}/8000 chars ({frac:.0%})")
+    t.add_row("turns", f"{len(kept)} of {len(turns)} rows in the window"
+              f"  [dim](last {cfg.history_turns * 2}; answers clipped at 800 chars/voice)[/]")
+    t.add_row("summary", f"{len(summary)} chars from a /compact" if summary else "[dim]none[/]")
+    t.add_row("next turn ships", f"{len(_history_preamble(cfg))} chars of preamble to each head")
+    if frac >= 0.8 or len(turns) > len(kept):
+        t.add_row("", "[dim]older turns are falling off — /compact folds them into a summary[/]")
+    console.print(t)
+
+
+def _compact(cfg: Config, console: Console) -> None:
+    """Squash the WHOLE chain (not just the preamble window) into a summary the claude head
+    writes, then open a fresh session carrying it — the chain ends at a summary, so memory
+    shrinks to one block and the conversation keeps going. Nothing is lost: the old session
+    stays in the ledger, /switch brings it back verbatim."""
+    from .backends import proposer
+    from .debate import _chain_turns, _safe
+    summary, turns = _chain_turns()
+    if not turns and not summary:
+        console.print("[dim]nothing to compact yet[/]")
+        return
+    corpus = ((f"Earlier summary:\n{summary}\n\n" if summary else "") + "\n\n".join(turns))[-24000:]
+    prompt = ("Compress this conversation into a summary that lets it continue seamlessly. "
+              "Keep: decisions made, the position each voice holds, open questions, hard "
+              "constraints, and exact names/numbers. Drop pleasantries and dead ends. "
+              "Write terse notes, not prose.\n\n" + corpus)
+    with console.status(f"[dim]⧉ compacting {len(turns)} turn(s)…[/]", spinner="dots"):
+        text = _safe(proposer, prompt, cfg, "compact")
+    if text.startswith("_("):    # _safe's failure placeholder — never bake an error into memory
+        console.print("[red]✗ compact failed — memory unchanged[/]")
+        return
+    start_session(summary=text)
+    console.print(f"⧉ compacted — {len(turns)} turn(s) → {len(text)} chars of summary; "
+                  f"[dim]the full transcript stays in the ledger (/switch lists it)[/]")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 
 from .config import Config
 from .ledger import record
@@ -19,6 +20,31 @@ Return a clear, self-contained response. You have NO tools — reason in text on
 """
 
 
+class Cancelled(Exception):
+    """A head deliberately killed by the user's ^C — a cancellation, not a failure.
+    _safe records it as head_call cancelled=True; /report excludes it from the failure rate."""
+
+
+_INFLIGHT: set[subprocess.Popen] = set()
+_KILLED: set[subprocess.Popen] = set()   # marked by kill_inflight so _run can tell ^C from a crash
+_ILOCK = threading.Lock()
+
+
+def kill_inflight() -> None:
+    """^C during a duel: the interrupt lands in the MAIN thread (the spinner loop) while the
+    heads run in pool workers. Mark + kill every live head here; each worker's communicate()
+    then returns and its _run raises Cancelled — so the pool drains instead of deadlocking
+    on shutdown, waiting for subprocesses nobody would ever reap."""
+    with _ILOCK:
+        procs = list(_INFLIGHT)
+        _KILLED.update(procs)
+    for p in procs:
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
 def proposer(message: str, cfg: Config) -> str:
     """Claude head — the REAL `claude` CLI, headless, NO tools.
     Prompt goes via STDIN: `--allowedTools` is variadic and eats a trailing positional
@@ -26,8 +52,10 @@ def proposer(message: str, cfg: Config) -> str:
     `--output-format json` → per-call cost lands in the ledger (fields `result` +
     `total_cost_usd`, live-verified 5 Jul 2026); a parse failure falls back to raw text —
     cost capture must NEVER kill the head."""
-    raw = _run([cfg.claude_command, "-p", "--output-format", "json", "--allowedTools", ""],
-               cfg, stdin=HEAD_PROMPT + "\n\n" + message)
+    argv = [cfg.claude_command, "-p", "--output-format", "json", "--allowedTools", ""]
+    if cfg.claude_model:
+        argv += ["--model", cfg.claude_model]        # /model claude <name> — shipped verbatim
+    raw = _run(argv, cfg, stdin=HEAD_PROMPT + "\n\n" + message)
     try:
         payload = json.loads(raw)
         usd = payload.get("total_cost_usd")
@@ -41,14 +69,40 @@ def proposer(message: str, cfg: Config) -> str:
 def adversary(message: str, cfg: Config) -> str:
     """Codex head — `codex exec`, headless, read-only sandbox.
     Why codex (not an openai-agents SDK): an unpinned model silently falls back to the Databricks
-    gateway; `codex exec` has no such fallback."""
-    return _run([cfg.codex_command, "exec", "--sandbox", "read-only",
-                 HEAD_PROMPT + "\n\n" + message], cfg)
+    gateway; `codex exec` has no such fallback. /model·/effort ride as `-m` and
+    `-c model_reasoning_effort=…` (unquoted — matches what codex receives from a shell user)."""
+    argv = [cfg.codex_command, "exec", "--sandbox", "read-only"]
+    if cfg.codex_model:
+        argv += ["-m", cfg.codex_model]
+    if cfg.codex_effort:
+        argv += ["-c", f"model_reasoning_effort={cfg.codex_effort}"]
+    return _run(argv + [HEAD_PROMPT + "\n\n" + message], cfg)
 
 
 def _run(argv: list[str], cfg: Config, stdin: str = "") -> str:
-    """One subprocess → its stdout. This IS council's whole 'executor'. Timeout so a hung head can't
-    wedge the debate. stdin is ALWAYS explicit (default: closed-empty) — an inherited terminal makes
-    `codex exec` read "additional input from stdin" and fight run_loop for keystrokes (verified 4 Jul)."""
-    return subprocess.run(argv, input=stdin, capture_output=True, text=True,
-                          check=True, timeout=cfg.head_timeout).stdout.strip()
+    """One subprocess → its stdout. This IS council's whole 'executor'. Timeout so a hung head
+    can't wedge the debate; the inflight registry so ^C can reach a head mid-flight. stdin is
+    ALWAYS explicit (default: closed-empty) — an inherited terminal makes `codex exec` read
+    "additional input from stdin" and fight run_loop for keystrokes (verified 4 Jul)."""
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    with _ILOCK:
+        _INFLIGHT.add(proc)
+    try:
+        out, err = proc.communicate(input=stdin, timeout=cfg.head_timeout)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        # KeyboardInterrupt = the SOLO path: the main thread is right here in communicate().
+        # (Duel-path ^C lands in the spinner instead → kill_inflight marks + kills from there.)
+        proc.kill()
+        proc.communicate()               # reap; drains the pipes so kill can't leave a zombie
+        raise
+    finally:
+        with _ILOCK:
+            _INFLIGHT.discard(proc)
+            killed = proc in _KILLED
+            _KILLED.discard(proc)
+    if killed:
+        raise Cancelled(f"{argv[0]} killed by ^C")
+    if proc.returncode != 0:             # stderr tail in the message → _safe's ledger row says WHY
+        raise RuntimeError(f"{argv[0]} exited {proc.returncode}: {(err or '').strip()[-300:]}")
+    return out.strip()
