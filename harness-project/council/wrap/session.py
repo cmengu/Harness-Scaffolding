@@ -28,6 +28,7 @@ from .events import read_events
 from .render import Renderer
 from .state import save_launch_cwd
 from .state_hook import STATE_FILE
+from .tui_contract import PROMPT_GLYPH
 
 
 # ── H1b — the state machine council drives off (no screen-scraping) ──────────
@@ -93,30 +94,52 @@ class SessionState:
 
 # ── H2 — confirmed inject ─────────────────────────────────────────────────────
 
+def _deliver(bridge: Path, text: str, state: SessionState, renderer, cfg: Config) -> tuple[bool, dict]:
+    """One paste → a receipt window with Enter re-presses → at most ONE full re-paste.
+    Returns (confirmed, advisory). The re-paste exists for the first-ever launch in a
+    directory: claude drops the first paste during first-visit init even though the
+    composer glyph is already rendered (live-hit 7 Jul 2026; second visits never see it).
+    Re-pasting is gated on the draft being INVISIBLE — if the text is (or might be) in
+    the box, pasting again would double it, so we fail loud instead. Enter re-presses
+    inside the window stay safe by the old argument: Enter on an empty box is a no-op."""
+    sent_at = time.time()                        # wall clock — same clock the hook stamps
+    advisory: dict = {"needle": "", "draft_seen": False}
+    for attempt in range(2):
+        advisory = inject(bridge, text, timeout_s=cfg.tmux_ready_timeout,
+                          settle_s=cfg.paste_settle, draft_watch_s=cfg.draft_watch_timeout)
+        deadline = time.monotonic() + cfg.submit_timeout
+        while time.monotonic() < deadline:
+            slice_s = min(cfg.submit_retry_interval, max(deadline - time.monotonic(), 0.05))
+            if state.wait_submitted(since_ts=sent_at, timeout=slice_s):
+                return True, advisory
+            with contextlib.suppress(RuntimeError):
+                press_enter(bridge)
+        if attempt == 0 and not advisory["draft_seen"] \
+                and not draft_lingering(bridge, advisory["needle"]):
+            record({"role": "paste_retry", "text": text[:200]})   # evidence trail, like scrape_advisory
+            renderer.notice("first paste vanished (fresh-launch wart) — re-pasting once…")
+            continue
+        break                                    # draft visible (or 2nd attempt): never paste again
+    return False, advisory
+
+
 def _inject_confirmed(bridge: Path, text: str, state: SessionState, renderer, cfg: Config) -> None:
     """D1: the H2 receipt DRIVES delivery. inject pastes and presses Enter once; while the
     receipt is missing we re-press Enter (the common miss = a swallowed/coalesced Enter,
     and Enter on an empty box is a no-op). The scrape's opinion is advisory: recorded to
     the ledger ONLY when it disagrees with the receipt — an empty scrape_advisory log over
     real usage is the evidence that earns deleting the scrape from bridge.py entirely."""
-    sent_at = time.time()                        # wall clock — same clock the hook stamps
     try:
-        advisory = inject(bridge, text, timeout_s=cfg.tmux_ready_timeout,
-                          settle_s=cfg.paste_settle, draft_watch_s=cfg.draft_watch_timeout)
+        confirmed, advisory = _deliver(bridge, text, state, renderer, cfg)
     except RuntimeError as exc:
         renderer.error(f"⚠ inject failed: {exc}")
         record({"role": "inject_error", "text": text, "error": str(exc)})
         return
-    deadline = time.monotonic() + cfg.submit_timeout
-    while time.monotonic() < deadline:
-        slice_s = min(cfg.submit_retry_interval, max(deadline - time.monotonic(), 0.05))
-        if state.wait_submitted(since_ts=sent_at, timeout=slice_s):
-            if advisory["draft_seen"] and draft_lingering(bridge, advisory["needle"]):
-                record({"role": "scrape_advisory", "text": text,
-                        "note": "receipt confirmed but the pane still shows the draft"})
-            return
-        with contextlib.suppress(RuntimeError):
-            press_enter(bridge)
+    if confirmed:
+        if advisory["draft_seen"] and draft_lingering(bridge, advisory["needle"]):
+            record({"role": "scrape_advisory", "text": text,
+                    "note": "receipt confirmed but the pane still shows the draft"})
+        return
     renderer.error(f"⚠ inject NOT confirmed in {cfg.submit_timeout}s — "
                    "message may not have submitted")
     record({"role": "inject_error", "text": text, "waited_s": cfg.submit_timeout,
@@ -127,12 +150,15 @@ def _inject_confirmed(bridge: Path, text: str, state: SessionState, renderer, cf
 
 # ── D2 answered — the permission relay ────────────────────────────────────────
 
-def _answer_permission(bridge: Path, renderer, state: SessionState) -> None:
+def _answer_permission(bridge: Path, renderer, state: SessionState) -> str | None:
     """The hidden pane is showing a permission prompt (a menu the user can't see).
     Show claude's own prompt text, forward ONE answer verbatim, and optimistically
     clear the blocked flag: no marker fires when a prompt is ANSWERED (PermissionRequest
     only fires when one OPENS), so waiting for a clearing marker would re-prompt forever.
-    A wrong keystroke degrades to the stall path — which now shows the pane tail."""
+    A wrong keystroke degrades to the stall path — which now shows the pane tail.
+    Returns a pump verb ("exit"/"detach") when the user typed one — an agentic claude can
+    re-raise the prompt every few seconds, and forwarding /exit into that menu would trap
+    the user in the relay forever (live-hit 6 Jul 2026: the only way out was kill-session)."""
     renderer.console.rule("[yellow]⛔ permission — the hidden claude is asking[/]",
                           style="yellow", align="left")
     renderer.console.print(pane_tail(bridge) or "[dim](could not capture the prompt)[/]")
@@ -141,13 +167,18 @@ def _answer_permission(bridge: Path, renderer, state: SessionState) -> None:
     except (EOFError, KeyboardInterrupt):
         renderer.notice("left unanswered — the prompt stays up; the stall check takes over")
         state.blocked = False
-        return
+        return None
+    if ans in ("/exit", "/quit", "exit", "quit"):     # pump verbs act on the WRAPPER,
+        return "exit"                                 # never on claude's menu
+    if ans == "/detach":
+        return "detach"
     try:
         send_keys(bridge, ans)
     except RuntimeError as exc:
         renderer.error(f"⚠ could not reach the pane: {exc}")
     record({"role": "code_permission", "answer": ans})
     state.blocked = False
+    return None
 
 
 # ── H1d — the input pump, gated on idle ───────────────────────────────────────
@@ -159,7 +190,9 @@ def _input_pump(bridge: Path, renderer, state: SessionState, cfg: Config) -> str
     while True:
         outcome = state.wait_idle(timeout=cfg.turn_timeout)
         if outcome == "blocked":
-            _answer_permission(bridge, renderer, state)       # D2: answer it, don't just warn
+            verb = _answer_permission(bridge, renderer, state)   # D2: answer it, don't just warn
+            if verb:
+                return verb                                      # /exit·/detach typed AT the relay
             continue
         if outcome == "timeout":
             stalls += 1
@@ -201,17 +234,49 @@ def _boot_probe(bridge: Path, state: SessionState, renderer, cfg: Config) -> Non
     it costs a turn and a line of conversation, and post-D1 the first real inject
     already fails loud within submit_timeout anyway."""
     renderer.notice("boot probe: verifying the hook receipt loop…")
-    sent_at = time.time()
-    try:
-        inject(bridge, "council boot probe — reply with just: ok",
-               timeout_s=cfg.tmux_ready_timeout, settle_s=cfg.paste_settle,
-               draft_watch_s=cfg.draft_watch_timeout)
+    try:                                             # same delivery path real messages use —
+        confirmed, _ = _deliver(bridge, "council boot probe — reply with just: ok",
+                                state, renderer, cfg)   # incl. the fresh-launch re-paste
     except RuntimeError as exc:
         sys.exit(f"council: boot probe could not reach the hidden claude: {exc}")
-    if not state.wait_submitted(since_ts=sent_at, timeout=cfg.submit_timeout):
-        sys.exit("council: boot probe was never confirmed — council's hooks are not firing "
-                 "inside claude (check --settings registration); refusing to run blind")
+    if not confirmed:
+        tail = pane_tail(bridge)                     # self-diagnosing: a blocking dialog or a
+        sys.exit("council: boot probe was never confirmed — either council's hooks are not "
+                 "firing inside claude (check --settings registration) or a dialog is eating "
+                 "the input; refusing to run blind. The hidden pane shows:\n"
+                 + (tail or "(could not capture the pane)"))     # dead pane shows itself HERE
     renderer.notice("boot probe confirmed ✓")
+
+
+# ── first-launch trust dialog ─────────────────────────────────────────────────
+
+def _answer_boot_dialog(bridge: Path, renderer, cfg: Config) -> None:
+    """First launch in a NEW cwd: claude shows "Do you trust the files in this folder?"
+    BEFORE mounting the input box, and NO hook event fires for it — a blind inject types
+    into the menu and its Enter accepts the dialog silently (live-hit 6 Jul 2026: the
+    boot probe's text vanished into it). The pane is the only channel that can see this,
+    so this one boot-time check is deliberately a scrape: poll until the composer glyph
+    appears (normal boot in a trusted dir → zero added latency) or the dialog text shows —
+    then relay it like any permission prompt. Never auto-answered: trust is the user's call."""
+    deadline = time.monotonic() + cfg.tmux_ready_timeout
+    while time.monotonic() < deadline:
+        tail = pane_tail(bridge) or ""
+        if "trust the files" in tail.lower():
+            renderer.console.rule("[yellow]⛔ first-launch check — the hidden claude is asking[/]",
+                                  style="yellow", align="left")
+            renderer.console.print(tail)
+            try:
+                ans = renderer.console.input("[bold yellow]answer (1/2/esc/enter) ›[/] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                renderer.notice("left unanswered — the dialog stays up; the first inject will fail loud")
+                return
+            with contextlib.suppress(RuntimeError):
+                send_keys(bridge, ans)
+            record({"role": "code_permission", "dialog": "trust", "answer": ans})
+            return
+        if PROMPT_GLYPH in tail:             # composer is up — nothing blocking, boot on
+            return
+        time.sleep(0.3)
 
 
 # ── the conductor ─────────────────────────────────────────────────────────────
@@ -266,6 +331,8 @@ def _attached_loop(bridge: Path, cfg: Config, *, fresh: bool) -> None:
     out.start()                                 # pump 1: claude's 4 channels → council's skin
     why = "exit"
     try:
+        if fresh:
+            _answer_boot_dialog(bridge, renderer, cfg)  # trust dialog fires NO hook — scrape once
         if fresh and cfg.boot_probe:
             _boot_probe(bridge, state, renderer, cfg)   # D3: fail at boot, not mid-conversation
         why = _input_pump(bridge, renderer, state, cfg)  # pump 2: council's box → the hidden pane

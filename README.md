@@ -139,9 +139,13 @@ not distributed here.
 ## Status / roadmap
 
 - Pane screen-scraping is **demoted to advisory** — the hook receipt is the sole delivery
-  oracle; the scrape will be deleted once the disagreement log stays empty in real use.
+  oracle; the scrape will be deleted once the disagreement log stays empty in real use
+  (the log is empty so far, including live code sessions).
 - `council review` (cross-family code review) is documented future work, cut from v1.
-- The `PermissionRequest` hook event name is still **unverified against a live session**.
-  The permission relay, budget checkpoints, and approval memory all degrade gracefully if
-  it never fires (back to the stall-warning world), but the first live `council code` run
-  should confirm the event actually arrives.
+- The `PermissionRequest` hook event is **verified live** (7 Jul 2026): the relay
+  surfaced a real gated `git push`, forwarded the answer, and recorded it. Typing
+  `/exit` or `/detach` at the relay acts on the wrapper (never forwarded to the menu).
+- **First-ever launch in a directory**: claude drops the first paste during first-visit
+  initialization even after the input box renders. Delivery now detects the vanished
+  draft and re-pastes once (`paste_retry` ledger rows track how often this fires);
+  the boot probe uses the same path and its failure message now shows the hidden pane.
