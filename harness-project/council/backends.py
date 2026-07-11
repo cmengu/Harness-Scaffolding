@@ -58,6 +58,20 @@ _KILLED: set[subprocess.Popen] = set()   # marked by kill_inflight so _run can t
 _ILOCK = threading.Lock()
 
 
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the head AND its children. codex spawns workers that inherit the stdout pipe:
+    killing only the parent leaves readline blocked until the orphans exit (live-observed
+    11 Jul: a '300s' timeout that returned after 389s). Heads start in their own session
+    (start_new_session=True), so the process group id IS the head's pid."""
+    try:
+        os.killpg(os.getpgid(proc.pid), 9)
+    except (OSError, PermissionError):
+        try:
+            proc.kill()                      # group already gone (or not ours): plain kill
+        except OSError:
+            pass
+
+
 def kill_inflight() -> None:
     """^C during a duel: the interrupt lands in the MAIN thread (the spinner loop) while the
     heads run in pool workers. Mark + kill every live head here; each worker's communicate()
@@ -67,10 +81,7 @@ def kill_inflight() -> None:
         procs = list(_INFLIGHT)
         _KILLED.update(procs)
     for p in procs:
-        try:
-            p.kill()
-        except OSError:
-            pass
+        _kill_tree(p)
 
 
 def _classify(exc: Exception) -> str:
@@ -301,18 +312,30 @@ def _codex_stream_events(e: dict, session: HeadSessions | None):
 def _run_lines(argv: list[str], cfg: Config, stdin: str = "", env: dict | None = None):
     """Streaming twin of _run: one subprocess → its stdout, line by line, as a generator.
     Same contracts: explicit stdin, inflight registry (^C reaches mid-flight heads), and a
-    timeout — here a watchdog timer that KILLS the process at head_timeout, because the
-    consumer thread is inside readline and can't watch a clock. stderr is read after EOF
-    (heads keep it small — codex banners, claude warnings; a >64KB flood would deadlock,
-    accepted). Early generator close (consumer bails) kills the child in the finally."""
+    watchdog — an IDLE timeout, not wall-clock (11 Jul live finding: a deep research round
+    is healthily streaming events at 295s; killing it at head_timeout threw away a whole
+    report). A head is dead only after head_timeout seconds of SILENCE; every line resets
+    the clock. The watchdog thread kills the whole process group (codex leaves orphans
+    holding the pipe otherwise). stderr is read after EOF (heads keep it small — a >64KB
+    flood would deadlock, accepted). Early generator close kills the child in the finally."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True,
                             env={**os.environ, **env} if env else None)
     with _ILOCK:
         _INFLIGHT.add(proc)
+    last = [time.monotonic()]
     timed_out = threading.Event()
-    watchdog = threading.Timer(cfg.head_timeout,
-                               lambda: (timed_out.set(), proc.kill()))
+
+    def _watch() -> None:
+        while proc.poll() is None:
+            idle = time.monotonic() - last[0]
+            if idle >= cfg.head_timeout:
+                timed_out.set()
+                _kill_tree(proc)
+                return
+            time.sleep(min(5.0, cfg.head_timeout - idle))
+
+    watchdog = threading.Thread(target=_watch, daemon=True)
     watchdog.start()
     err = ""
     try:
@@ -322,13 +345,13 @@ def _run_lines(argv: list[str], cfg: Config, stdin: str = "", env: dict | None =
         except (BrokenPipeError, OSError):
             pass                              # a fast-dying head: the exit check below reports it
         for line in proc.stdout:
+            last[0] = time.monotonic()
             yield line
         err = proc.stderr.read()
         proc.wait()
     finally:
-        watchdog.cancel()
         if proc.poll() is None:               # consumer closed us early — reap the child
-            proc.kill()
+            _kill_tree(proc)
             proc.wait()
         with _ILOCK:
             _INFLIGHT.discard(proc)
@@ -349,7 +372,7 @@ def _run(argv: list[str], cfg: Config, stdin: str = "", env: dict | None = None)
     "additional input from stdin" and fight run_loop for keystrokes (verified 4 Jul).
     `env` = EXTRA vars layered over the inherited environment (depth pack: MAX_THINKING_TOKENS)."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True,
                             env={**os.environ, **env} if env else None)
     with _ILOCK:
         _INFLIGHT.add(proc)
@@ -358,7 +381,7 @@ def _run(argv: list[str], cfg: Config, stdin: str = "", env: dict | None = None)
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
         # KeyboardInterrupt = the SOLO path: the main thread is right here in communicate().
         # (Duel-path ^C lands in the spinner instead → kill_inflight marks + kills from there.)
-        proc.kill()
+        _kill_tree(proc)
         proc.communicate()               # reap; drains the pipes so kill can't leave a zombie
         raise
     finally:

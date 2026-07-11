@@ -6,6 +6,7 @@ from __future__ import annotations
 import difflib
 import queue
 import random
+import subprocess
 import threading
 import time
 from contextlib import nullcontext
@@ -32,6 +33,23 @@ class DebateResult:
     escalated: bool = False
     agree: str | None = None
     differ: str | None = None
+
+
+def _is_dead(text: str) -> bool:
+    """A head's failure/cancellation marker (the `_(claude unavailable: …)_` convention
+    _safe and the tape both emit). Load-bearing: run() must never feed these to the other
+    head as 'answers' — live-observed 11 Jul, a dead round 0 produced a round 1 of heads
+    earnestly critiquing each other's error messages."""
+    t = text.strip()
+    return t.startswith("_(") and t.endswith(")_")
+
+
+def _err_text(e: Exception, cfg: Config) -> str:
+    """Human words for a head failure. A TimeoutExpired repr truncates into what looks
+    like a broken command (live-observed 11 Jul) — say what actually happened instead."""
+    if isinstance(e, subprocess.TimeoutExpired):
+        return f"⏱ no output for {cfg.head_timeout}s — killed as hung"
+    return str(e)
 
 
 _ANSWER_MARK = "===ANSWER==="
@@ -77,6 +95,14 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     seeded = seed + question
     a, b = both(seeded, seeded, round_no=0)                             # round 0 (ANSWER mode)
     record({"role": "debate", "round": 0, "proposer": a, "adversary": b})
+    dead = [h for h, t in (("claude", a), ("codex", b)) if _is_dead(t)]
+    if dead:                                # a dead round 0 ends the debate — critiquing a
+        record({"role": "debate", "event": "round0_failed", "dead": dead})   # corpse is noise
+        if len(dead) == 2:
+            console.print("[red]✗ both heads failed — turn abandoned (nothing was answered)[/]")
+        else:
+            console.print(f"[yellow]⚠ {dead[0]} failed — single-voiced answer, no debate[/]")
+        return DebateResult(proposer_final=a, adversary_final=b, escalated=len(dead) == 2)
     for n in range(1, rounds + 1):
         prev_a, prev_b = a, b
         # One combined critique-and-final call per head per round (decision 11 Jul: 2 calls
@@ -92,6 +118,13 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
             msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\n{_CRIT_INSTR}"
             msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\n{_CRIT_INSTR}"
         raw_a, raw_b = both(msg_a, msg_b, round_no=n)
+        died = [h for h, t in (("claude", raw_a), ("codex", raw_b)) if _is_dead(t)]
+        if died:                             # mid-debate death: keep the last GOOD answers
+            record({"role": "debate", "event": "round_failed", "round": n, "dead": died})
+            console.print(f"[yellow]⚠ {' and '.join(died)} failed in round {n} — "
+                          "keeping the previous round's answers[/]")
+            a, b = prev_a, prev_b
+            break
         crit_a, a = _split_verdict(raw_a)
         crit_b, b = _split_verdict(raw_b)
         row = {"role": "debate", "round": n, "proposer": a, "adversary": b}
@@ -177,13 +210,14 @@ def _safe(fn, msg, cfg, label, sessions=None):
                 "secs": round(time.monotonic() - t0, 2)})   # stays clean), /report skips it
         return f"_({label} cancelled)_"
     except Exception as e:
+        friendly = _err_text(e, cfg)
         record({"role": "head_call", "head": label, "ok": False,
-                "secs": round(time.monotonic() - t0, 2), "error": str(e)[:500]})
-        record({"role": "head_error", "head": label, "kind": kind, "error": str(e)})
+                "secs": round(time.monotonic() - t0, 2), "error": friendly[:500]})
+        record({"role": "head_error", "head": label, "kind": kind, "error": friendly})
         quarantine(label, e, {"kind": kind, "attempts": attempts, "question": msg})
         if sessions is not None:
             sessions.clear(label)
-        return f"_({label} unavailable: {e})_"
+        return f"_({label} unavailable: {friendly})_"
 
 
 _HEAD_STYLE = {"claude": ("orange1", "Claude"), "codex": ("blue", "Codex")}
@@ -326,19 +360,20 @@ def _safe_stream(fn, msg, cfg, label, sessions=None):
             return
         except Exception as e:
             kind = _classify(e)
+            friendly = _err_text(e, cfg)
             if kind == "transient" and attempt < cfg.head_retries and not visible:
                 record({"role": "head_retry", "head": label, "attempt": attempt,
-                        "kind": kind, "error": str(e)[:500]})
-                yield _ev(label, "retry", {"attempt": attempt + 1, "error": str(e)[:200]})
+                        "kind": kind, "error": friendly[:500]})
+                yield _ev(label, "retry", {"attempt": attempt + 1, "error": friendly[:200]})
                 time.sleep(cfg.retry_base_delay * 2 ** attempt)
                 continue
             record({"role": "head_call", "head": label, "ok": False, "stream": True,
-                    "secs": round(time.monotonic() - t0, 2), "error": str(e)[:500]})
-            record({"role": "head_error", "head": label, "kind": kind, "error": str(e)})
+                    "secs": round(time.monotonic() - t0, 2), "error": friendly[:500]})
+            record({"role": "head_error", "head": label, "kind": kind, "error": friendly})
             quarantine(label, e, {"kind": kind, "attempts": attempt + 1, "question": msg})
             if sessions is not None:
                 sessions.clear(label)
-            yield _ev(label, "error", {"kind": kind, "error": str(e)[:500]})
+            yield _ev(label, "error", {"kind": kind, "error": friendly[:500]})
             return
 
 

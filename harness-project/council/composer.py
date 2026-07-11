@@ -89,8 +89,10 @@ class Composer:
         if text.strip():
             first, *rest = text.split("\n")
             self.console.print(f"[bold {self._accent}]{self._marker()}[/] {escape(first)}")
-            for line in rest:
+            for line in rest[:6]:            # a huge paste re-echoes as a stub, not a flood
                 self.console.print(f"[bold {self._accent}]…[/] {escape(line)}")
+            if len(rest) > 6:
+                self.console.print(f"[bold {self._accent}]…[/] [dim](+{len(rest) - 6} more lines)[/]")
         return text
 
     # ── internals ────────────────────────────────────────────────────────────
@@ -134,12 +136,15 @@ class Composer:
             buf.validate_and_handle()
 
         # Shift+Tab (BackTab): the duel toggle (step 8) — the friendlier twin of typing
-        # /duel. The callback prints its own confirmation (patch_stdout routes it above
-        # the prompt); the marker ⚔ › flips on the next render tick.
+        # /duel. The callback PRINTS, and printing from inside a binding while the app owns
+        # the screen corrupts the composer buffer (live-observed 11 Jul: the "⚔ adversary
+        # ON" confirmation leaked INTO the user's next message). run_in_terminal is the
+        # sanctioned escape hatch: suspend the app, run the callback, repaint.
         @kb.add("s-tab", eager=True)
         def _toggle(event) -> None:
             if self._on_toggle is not None:
-                self._on_toggle()
+                from prompt_toolkit.application import run_in_terminal
+                run_in_terminal(self._on_toggle)
                 event.app.invalidate()
 
         return kb
@@ -249,13 +254,18 @@ def _find_buffer_window(container) -> Window | None:
 
 
 def _visual_lines(text: str, *, columns: int, marker: str) -> int:
-    """Rows the buffer needs, counting soft-wraps — Document.line_count only counts \\n."""
+    """Rows the buffer needs, counting soft-wraps — Document.line_count only counts \\n.
+    SHORT-CIRCUITS at the display cap: this runs on EVERY render tick, and a huge paste
+    (hundreds of KB) must not turn each repaint into an O(paste) character walk — that
+    freeze was half of the 11 Jul paste crash."""
     prefix = sum(get_cwidth(c) for c in f"{marker} ")
     width = max(1, columns - prefix)
     rows = 0
     for line in text.split("\n"):
         w = sum(get_cwidth(c) for c in line)
         rows += max(1, (w + width - 1) // width)
+        if rows >= _MAX_INPUT_ROWS:          # already at the cap — counting further is waste
+            return _MAX_INPUT_ROWS
     return max(1, rows)
 
 
