@@ -33,6 +33,24 @@ class DebateResult:
     differ: str | None = None
 
 
+_ANSWER_MARK = "===ANSWER==="
+_CRIT_INSTR = (
+    "CRITIQUE the other voice first — name what it gets right and where it is weak, wrong or "
+    "incomplete (this part may reference them freely; it is scratch work). Then write a line "
+    f"containing only {_ANSWER_MARK} and give your best updated answer: complete, self-contained, "
+    "incorporating whatever the debate conceded, and NEVER mentioning the other voice or this "
+    "debate — it must stand alone.")
+
+
+def _split_verdict(text: str) -> tuple[str, str]:
+    """(critique, standalone answer). A head that ignores the marker forfeits the dim
+    register — its whole reply is treated as the answer, never silently dropped."""
+    if _ANSWER_MARK in text:
+        crit, _, ans = text.partition(_ANSWER_MARK)
+        return crit.strip(), (ans.strip() or crit.strip())
+    return "", text.strip()
+
+
 def _duel_depth(cfg: Config) -> dict:
     """The armed profile (locked 10-11 Jul): claude thinks at the configured max, codex at
     /effort or high, both heads may research. Solo turns build their own cheaper dict."""
@@ -60,16 +78,27 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     record({"role": "debate", "round": 0, "proposer": a, "adversary": b})
     for n in range(1, rounds + 1):
         prev_a, prev_b = a, b
+        # One combined critique-and-final call per head per round (decision 11 Jul: 2 calls
+        # per head at default rounds=1). The reply carries scratch critique + ===ANSWER===
+        # + a standalone answer — any round may end the duel (early-stop), so EVERY round's
+        # answer must stand alone.
         if sessions is not None:
-            msg_a = f"The other voice said:\n{prev_b}\n\nCRITIQUE, then update your answer."
-            msg_b = f"The other voice said:\n{prev_a}\n\nCRITIQUE, then update your answer."
+            msg_a = f"The other voice said:\n{prev_b}\n\n{_CRIT_INSTR}"
+            msg_b = f"The other voice said:\n{prev_a}\n\n{_CRIT_INSTR}"
         else:
             # Question (incl. seed) stays in EVERY round — a stateless head otherwise
             # drifts into critiquing prose style
-            msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\nCRITIQUE, then update."
-            msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\nCRITIQUE, then update."
-        a, b = both(msg_a, msg_b, round_no=n)
-        record({"role": "debate", "round": n, "proposer": a, "adversary": b})
+            msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\n{_CRIT_INSTR}"
+            msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\n{_CRIT_INSTR}"
+        raw_a, raw_b = both(msg_a, msg_b, round_no=n)
+        crit_a, a = _split_verdict(raw_a)
+        crit_b, b = _split_verdict(raw_b)
+        row = {"role": "debate", "round": n, "proposer": a, "adversary": b}
+        if crit_a:
+            row["proposer_critique"] = crit_a       # the deliverable stays clean; the scratch
+        if crit_b:
+            row["adversary_critique"] = crit_b      # work survives for replay/audit
+        record(row)
         if _moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10:        # deterministic early-stop
             record({"role": "debate", "event": "converged", "round": n})
             break
@@ -235,11 +264,15 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
                     if isinstance(payload, dict) and payload.get("usd") is not None:
                         spent[head] = f" ${payload['usd']:.2f}"
                 elif kind == "final":
-                    finals[head] = str(payload)
+                    finals[head] = str(payload)          # raw back to run(), which re-splits
+                    crit, ans = _split_verdict(finals[head]) if round_no else ("", finals[head])
+                    if crit:                             # scratch work: dim, honestly labelled
+                        console.print(f"[dim][{color}]{g}[/] {name} challenges:[/dim]")
+                        console.print(f"[dim]{crit}[/dim]")
                     console.rule(f"[{color}]{g} {name}[/]"
                                  + (f"  [dim]round {round_no}[/]" if round_no else ""),
                                  style=color, align="left")
-                    console.print(finals[head])
+                    console.print(ans)
                 elif kind == "error":
                     if isinstance(payload, dict) and payload.get("cancelled"):
                         finals[head] = f"_({head} cancelled)_"

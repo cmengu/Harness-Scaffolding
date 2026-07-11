@@ -15,12 +15,12 @@ def taped():
     return Console(file=buf, width=100), buf
 
 
-def test_default_duel_streams_and_renders_the_tape(tmp_path, monkeypatch):
-    argv = tmp_path / "argv"
-    monkeypatch.setenv("COUNCIL_STUB_ARGV", str(argv))
+def test_default_duel_streams_and_renders_the_tape(monkeypatch):
     console, buf = taped()
     result = debate.run("moon?", rounds=1, judge=None, cfg=load_config(), console=console)
-    assert "stream-json" in argv.read_text()             # the pump, not the block path
+    # the pump, not the block path (argv capture races between the two heads — the
+    # ledger's stream flag is the unambiguous witness)
+    assert all(c.get("stream") for c in trace(role="head_call"))
     out = buf.getvalue()
     assert "✳ Claude" in out and "⬡ Codex" in out        # brand-glyph gutters
     assert "challenge each other" in out                 # honest critique-round label

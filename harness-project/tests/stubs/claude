@@ -5,10 +5,12 @@
 #   COUNCIL_STUB_CAPTURE = file to receive the stdin prompt
 #   COUNCIL_STUB_ARGV    = file to receive the argv line
 #   COUNCIL_STUB_ENV     = file to receive MAX_THINKING_TOKENS
+#   COUNCIL_STUB_TEXT    = override the canned answer text (step-6 marker tests)
 # session_id mirrors the real CLI's result payload (probes 11 Jul).
 [ -n "$COUNCIL_STUB_ARGV" ] && printf '%s ' "$@" > "$COUNCIL_STUB_ARGV"
 if [ -n "$COUNCIL_STUB_CAPTURE" ]; then cat > "$COUNCIL_STUB_CAPTURE"; else cat > /dev/null; fi
 [ -n "$COUNCIL_STUB_ENV" ] && echo "MAX_THINKING_TOKENS=$MAX_THINKING_TOKENS" > "$COUNCIL_STUB_ENV"
+TEXT="${COUNCIL_STUB_TEXT:-STUB CLAUDE: the moon is made of rock}"
 for a in "$@"; do [ "$a" = "stream-json" ] && STREAM=1; done
 if [ -n "$STREAM" ]; then
   echo '{"type":"system","subtype":"init"}'
@@ -17,7 +19,7 @@ if [ -n "$STREAM" ]; then
   echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"WebSearch","input":{"query":"moon"}}]}}'
   echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"the moon is made of rock"}}}'
   echo '{"type":"stream_event","event":{"type":"message_delta","delta":{},"usage":{"output_tokens_details":{"thinking_tokens":42}}}}'
-  echo '{"type":"result","result":"STUB CLAUDE: the moon is made of rock","total_cost_usd":0.0042,"session_id":"stub-claude-sid"}'
+  echo '{"type":"result","result":"'"$TEXT"'","total_cost_usd":0.0042,"session_id":"stub-claude-sid"}'
 else
-  echo '{"result": "STUB CLAUDE: the moon is made of rock", "total_cost_usd": 0.0042, "session_id": "stub-claude-sid"}'
+  echo "{\"result\": \"$TEXT\", \"total_cost_usd\": 0.0042, \"session_id\": \"stub-claude-sid\"}"
 fi
