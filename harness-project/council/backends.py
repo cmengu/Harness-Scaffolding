@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import uuid
@@ -11,15 +12,24 @@ from dataclasses import dataclass
 from .config import Config
 from .ledger import record
 
-HEAD_PROMPT = """\
+_HEAD_PROMPT_BASE = """\
 You are one of two voices in a council. You are a thinking-and-writing responder.
 You are dispatched in one of two modes (the message makes which clear):
 - ANSWER   — given a question. Answer directly and well; be concrete; offer options w/ trade-offs.
 - CRITIQUE — given your own last answer + the OTHER voice's answer. Name what it gets right, where
   it's weak/wrong/incomplete, then give your updated answer. Don't cave just to agree; don't dig in
   from pride — converge toward what's correct.
-Return a clear, self-contained response. You have NO tools — reason in text only.
-"""
+Return a clear, self-contained response. """
+
+
+def _head_prompt(tools: bool) -> str:
+    return _HEAD_PROMPT_BASE + (
+        "You have read-only research tools (files, web search) — use them when the question "
+        "genuinely benefits from checked facts, not reflexively.\n"
+        if tools else "You have NO tools — reason in text only.\n")
+
+
+HEAD_PROMPT = _head_prompt(False)   # the classic prompt; kept for callers that predate depth
 
 
 @dataclass
@@ -77,8 +87,9 @@ def _classify(exc: Exception) -> str:
     return "permanent"
 
 
-def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None) -> str:
-    """Claude head — the REAL `claude` CLI, headless, NO tools.
+def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None,
+             thinking: int = 0, tools: bool = False) -> str:
+    """Claude head — the REAL `claude` CLI, headless.
     Prompt goes via STDIN: `--allowedTools` is variadic and eats a trailing positional
     prompt as a tool name (live-verified vs claude 2.1.200, 4 Jul 2026).
     `--output-format json` → per-call cost lands in the ledger (fields `result` +
@@ -86,14 +97,19 @@ def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None) 
     cost capture must NEVER kill the head.
     With a session: first call mints `--session-id`, later calls `--resume` — the head
     then remembers its own earlier rounds (incl. tool-derived facts) and resumed turns
-    ride the cache at ~5x lower cost (probes 11 Jul)."""
-    argv = [cfg.claude_command, "-p", "--output-format", "json", "--allowedTools", ""]
+    ride the cache at ~5x lower cost (probes 11 Jul).
+    Depth: `thinking` rides the MAX_THINKING_TOKENS env (probes 11 Jul; the text stays
+    redacted headless — only the token count comes back); `tools` opens cfg.claude_tools
+    (read-only research set, no Bash) — headless -p auto-approves allowlisted tools."""
+    argv = [cfg.claude_command, "-p", "--output-format", "json",
+            "--allowedTools", cfg.claude_tools if tools else ""]
     if session is not None:
         argv += ["--resume", session.claude] if session.claude \
             else ["--session-id", str(uuid.uuid4())]
     if cfg.claude_model:
         argv += ["--model", cfg.claude_model]        # /model claude <name> — shipped verbatim
-    raw = _run(argv, cfg, stdin=HEAD_PROMPT + "\n\n" + message)
+    env = {"MAX_THINKING_TOKENS": str(thinking)} if thinking > 0 else None
+    raw = _run(argv, cfg, stdin=_head_prompt(tools) + "\n\n" + message, env=env)
     try:
         payload = json.loads(raw)
         usd = payload.get("total_cost_usd")
@@ -106,14 +122,21 @@ def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None) 
         return raw
 
 
-def adversary(message: str, cfg: Config, *, session: HeadSessions | None = None) -> str:
+def adversary(message: str, cfg: Config, *, session: HeadSessions | None = None,
+              effort: str | None = None, tools: bool = False) -> str:
     """Codex head — `codex exec`, headless, read-only sandbox.
     Why codex (not an openai-agents SDK): an unpinned model silently falls back to the Databricks
     gateway; `codex exec` has no such fallback. /model·/effort ride as `-m` and
     `-c model_reasoning_effort=…` (unquoted — matches what codex receives from a shell user).
     With a session: `--json` events expose the `thread_id` (thread.started) that
     `exec resume <id>` continues; `--skip-git-repo-check` because a duel can be armed in
-    any cwd, not just a trusted git repo (probes 11 Jul). Sessionless stays plain-stdout."""
+    any cwd, not just a trusted git repo (probes 11 Jul). Sessionless stays plain-stdout.
+    Depth: `effort` overrides cfg.codex_effort per call (the duel arms high); `tools`
+    adds live web search (`tools.web_search=true` — the `--search` flag is interactive-only;
+    file reading is already native to codex's read-only sandbox)."""
+    effort = effort or cfg.codex_effort
+    depth_argv = (["-c", f"model_reasoning_effort={effort}"] if effort else []) \
+        + (["-c", "tools.web_search=true"] if tools else [])
     if session is not None:
         if session.codex:
             argv = [cfg.codex_command, "exec", "resume", session.codex,
@@ -123,15 +146,12 @@ def adversary(message: str, cfg: Config, *, session: HeadSessions | None = None)
                     "--skip-git-repo-check"]
             if cfg.codex_model:
                 argv += ["-m", cfg.codex_model]      # model is fixed at mint; resume inherits it
-        if cfg.codex_effort:
-            argv += ["-c", f"model_reasoning_effort={cfg.codex_effort}"]
-        return _codex_events(_run(argv + [HEAD_PROMPT + "\n\n" + message], cfg), session)
+        return _codex_events(
+            _run(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg), session)
     argv = [cfg.codex_command, "exec", "--sandbox", "read-only"]
     if cfg.codex_model:
         argv += ["-m", cfg.codex_model]
-    if cfg.codex_effort:
-        argv += ["-c", f"model_reasoning_effort={cfg.codex_effort}"]
-    return _run(argv + [HEAD_PROMPT + "\n\n" + message], cfg)
+    return _run(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg)
 
 
 def _codex_events(raw: str, session: HeadSessions) -> str:
@@ -157,13 +177,15 @@ def _codex_events(raw: str, session: HeadSessions) -> str:
     return "\n\n".join(t for t in texts if t).strip() or raw
 
 
-def _run(argv: list[str], cfg: Config, stdin: str = "") -> str:
+def _run(argv: list[str], cfg: Config, stdin: str = "", env: dict | None = None) -> str:
     """One subprocess → its stdout. This IS council's whole 'executor'. Timeout so a hung head
     can't wedge the debate; the inflight registry so ^C can reach a head mid-flight. stdin is
     ALWAYS explicit (default: closed-empty) — an inherited terminal makes `codex exec` read
-    "additional input from stdin" and fight run_loop for keystrokes (verified 4 Jul)."""
+    "additional input from stdin" and fight run_loop for keystrokes (verified 4 Jul).
+    `env` = EXTRA vars layered over the inherited environment (depth pack: MAX_THINKING_TOKENS)."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
+                            stderr=subprocess.PIPE, text=True,
+                            env={**os.environ, **env} if env else None)
     with _ILOCK:
         _INFLIGHT.add(proc)
     try:

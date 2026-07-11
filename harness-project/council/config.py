@@ -38,6 +38,14 @@ class Config:
     head_sessions: bool = True       # duel memory via native resume (claude --resume / codex exec
                                      # resume; probes 11 Jul). False = every round reseeds from the
                                      # ledger preamble (the old stateless behavior, kept as fallback)
+    # Depth pack (step 3; decisions 10-11 Jul: duel = max depth, cost accepted; solo = fast
+    # by default but the owner may arm it). claude thinks via MAX_THINKING_TOKENS (0 = off;
+    # 31999 = the interactive "ultrathink" cap); codex depth = /effort (codex_effort below).
+    duel_thinking_tokens: int = 31999
+    duel_tools: bool = True          # duel heads may research: claude claude_tools, codex web search
+    solo_thinking_tokens: int = 0
+    solo_tools: bool = False
+    claude_tools: str = "Read Grep Glob WebSearch WebFetch"   # the allowlist when tools are on (no Bash in v1)
     head_retries: int = 2            # attempts AFTER the first try — spent on TRANSIENT failures only
     retry_base_delay: float = 1.0    # backoff between attempts: 1s → 2s → 4s
     ask_budget_usd: float = 0.0      # ask-mode budget; > 0 = red nag in the turn receipt once crossed

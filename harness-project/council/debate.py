@@ -30,8 +30,16 @@ class DebateResult:
     differ: str | None = None
 
 
+def _duel_depth(cfg: Config) -> dict:
+    """The armed profile (locked 10-11 Jul): claude thinks at the configured max, codex at
+    /effort or high, both heads may research. Solo turns build their own cheaper dict."""
+    return {"thinking": cfg.duel_thinking_tokens, "tools": cfg.duel_tools,
+            "effort": cfg.codex_effort or "high"}
+
+
 def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | None = None,
-        sessions: HeadSessions | None = None, seed: str = "") -> DebateResult:
+        sessions: HeadSessions | None = None, seed: str = "",
+        depth: dict | None = None) -> DebateResult:
     """Fan to both heads, cross-critique up to N rounds (early-stop on no movement), present, maybe judge.
     `judge`: falsy=off · 'moderator'=neutral merge · 'reasoning'=verdict, may escalate. (bool True → 'moderator'.)
     `sessions` = native head memory (11 Jul): rounds ≥1 send ONLY the other voice's answer —
@@ -41,8 +49,9 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     console = console or Console()
     if judge is True:
         judge = "moderator"
+    depth = depth or _duel_depth(cfg)                                   # a debate defaults to armed depth
     seeded = seed + question
-    a, b = _both(seeded, seeded, cfg, console, sessions)                # round 0 (ANSWER mode)
+    a, b = _both(seeded, seeded, cfg, console, sessions, depth)         # round 0 (ANSWER mode)
     record({"role": "debate", "round": 0, "proposer": a, "adversary": b})
     for n in range(1, rounds + 1):
         prev_a, prev_b = a, b
@@ -54,7 +63,7 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
             # drifts into critiquing prose style
             msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\nCRITIQUE, then update."
             msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\nCRITIQUE, then update."
-        a, b = _both(msg_a, msg_b, cfg, console, sessions)
+        a, b = _both(msg_a, msg_b, cfg, console, sessions, depth)
         record({"role": "debate", "round": n, "proposer": a, "adversary": b})
         if _moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10:        # deterministic early-stop
             record({"role": "debate", "event": "converged", "round": n})
@@ -66,16 +75,21 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     return result
 
 
-def _both(msg_a, msg_b, cfg, console, sessions=None):
+def _both(msg_a, msg_b, cfg, console, sessions=None, depth=None):
     """Both heads concurrently with a live 🟠/🔵 status (block-then-present; columns can't
     stream-interleave). ^C here lands in the MAIN thread (this spinner loop) while the heads
     run in workers — kill the subprocesses FIRST (their communicate() unblocks, each worker
     finishes via _safe's Cancelled branch), THEN re-raise; otherwise pool.__exit__ blocks
     forever waiting on workers stuck in communicate()."""
+    depth = depth or {}
+    pa = partial(proposer, session=sessions,
+                 thinking=depth.get("thinking", 0), tools=depth.get("tools", False))
+    pb = partial(adversary, session=sessions,
+                 effort=depth.get("effort"), tools=depth.get("tools", False))
     with ThreadPoolExecutor(max_workers=2) as pool:
         try:
-            fa = pool.submit(_safe, partial(proposer, session=sessions), msg_a, cfg, "claude", sessions)
-            fb = pool.submit(_safe, partial(adversary, session=sessions), msg_b, cfg, "codex", sessions)
+            fa = pool.submit(_safe, pa, msg_a, cfg, "claude", sessions)
+            fb = pool.submit(_safe, pb, msg_b, cfg, "codex", sessions)
             with Live(_status(fa, fb), console=console, refresh_per_second=8) as live:
                 while not (fa.done() and fb.done()):
                     wait([fa, fb], timeout=0.15)
@@ -237,8 +251,10 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
     def handle(self, user_input: str) -> None:
         if not self.adversarial:                                # SOLO: claude only, with memory
             pre = _history_preamble(self.cfg)
+            solo = partial(proposer, thinking=self.cfg.solo_thinking_tokens,
+                           tools=self.cfg.solo_tools)           # fast by default; owner may arm
             with self.console.status("[dim]🟠 claude thinking… (^C cancels)[/]", spinner="dots"):
-                out = _safe(proposer, pre + user_input, self.cfg, "claude")
+                out = _safe(solo, pre + user_input, self.cfg, "claude")
             record({"role": "debate", "round": 0, "proposer": out, "adversary": None})
             self.console.print(f"[orange1]## 🟠 Claude[/]\n{out}")
             return

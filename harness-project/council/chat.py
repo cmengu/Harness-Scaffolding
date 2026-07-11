@@ -21,6 +21,8 @@ _COMMANDS: list[tuple[str, str, str]] = [
     ("/judge", "<style>", "off · moderator · reasoning"),
     ("/model", "[head name]", "per-head model override — /model claude opus · /model reset"),
     ("/effort", "[level]", "codex reasoning effort: minimal·low·medium·high · reset"),
+    ("/think", "<duel|solo> <n|max|off>", "claude thinking budget per mode (codex: /effort)"),
+    ("/tools", "<duel|solo> <on|off>", "may the heads research? (read-only files + web)"),
     ("/status", "", "adversary · rounds · judge · heads · session cost"),
     ("/cost", "", "what this session has spent so far"),
     ("/last", "", "reprint the previous answer / debate"),
@@ -183,6 +185,30 @@ def _slash(text: str, renderer, console: Console) -> None:
         who = cfg.heads.judge or "claude"
         console.print(f"judge = {cfg.judge_style or 'off'}"
                       + (f"  [dim]({who} merges/weighs after each duel)[/]" if cfg.judge_style else ""))
+    elif cmd == "/think":
+        mode, _, val = arg.partition(" ")
+        tokens = {"off": 0, "max": 31999}.get(val.strip(), None)
+        if tokens is None and val.strip().isdigit():
+            tokens = min(int(val.strip()), 31999)
+        if mode not in ("duel", "solo") or tokens is None:
+            console.print("[red]usage: /think <duel|solo> <tokens|max|off>[/] — "
+                          f"now duel {cfg.duel_thinking_tokens} · solo {cfg.solo_thinking_tokens}")
+            return
+        setattr(cfg, f"{mode}_thinking_tokens", tokens)
+        console.print(f"{mode} thinking = {tokens or 'off'}"
+                      + ("  [dim](claude's trace stays hidden headless — you'll see the count)[/]"
+                         if tokens else ""))
+    elif cmd == "/tools":
+        mode, _, val = arg.partition(" ")
+        if mode not in ("duel", "solo") or val.strip() not in ("on", "off"):
+            console.print("[red]usage: /tools <duel|solo> <on|off>[/] — "
+                          f"now duel {'on' if cfg.duel_tools else 'off'}"
+                          f" · solo {'on' if cfg.solo_tools else 'off'}")
+            return
+        setattr(cfg, f"{mode}_tools", val.strip() == "on")
+        console.print(f"{mode} tools = {val.strip()}"
+                      + ("  [dim](read-only: files + web search, no shell)[/]"
+                         if val.strip() == "on" else ""))
     elif cmd == "/status":
         _status(renderer, console)
     elif cmd == "/cost":
@@ -271,6 +297,11 @@ def _status(renderer, console: Console) -> None:
     t.add_row("heads", f"{cfg.claude_command}{f' ({cfg.claude_model})' if cfg.claude_model else ''}"
               f" · {cfg.codex_command}{f' ({cfg.codex_model})' if cfg.codex_model else ''}"
               + (f" · effort {cfg.codex_effort}" if cfg.codex_effort else ""))
+    think = lambda n: "off" if not n else ("max" if n >= 31999 else str(n))
+    t.add_row("depth", f"duel: think {think(cfg.duel_thinking_tokens)}"
+              f" · tools {'✓' if cfg.duel_tools else '✗'} · codex {cfg.codex_effort or 'high'}"
+              f"   solo: think {think(cfg.solo_thinking_tokens)}"
+              f" · tools {'✓' if cfg.solo_tools else '✗'}")
     t.add_row("memory", f"last {cfg.history_turns} turns from the ledger")
     if duel:
         s = getattr(renderer, "sessions", None)
