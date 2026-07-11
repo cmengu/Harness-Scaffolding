@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import difflib
+import queue
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -14,7 +16,8 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from .backends import Cancelled, HeadSessions, _classify, adversary, kill_inflight, proposer
+from .backends import (Cancelled, HeadSessions, _classify, adversary,
+                       adversary_stream, kill_inflight, proposer, proposer_stream)
 from .config import Config
 from .ledger import chain_rows, quarantine, record
 
@@ -50,8 +53,10 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     if judge is True:
         judge = "moderator"
     depth = depth or _duel_depth(cfg)                                   # a debate defaults to armed depth
+    both = partial(_stream_both if cfg.stream_tape else _both,
+                   cfg=cfg, console=console, sessions=sessions, depth=depth)
     seeded = seed + question
-    a, b = _both(seeded, seeded, cfg, console, sessions, depth)         # round 0 (ANSWER mode)
+    a, b = both(seeded, seeded, round_no=0)                             # round 0 (ANSWER mode)
     record({"role": "debate", "round": 0, "proposer": a, "adversary": b})
     for n in range(1, rounds + 1):
         prev_a, prev_b = a, b
@@ -63,21 +68,23 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
             # drifts into critiquing prose style
             msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\nCRITIQUE, then update."
             msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\nCRITIQUE, then update."
-        a, b = _both(msg_a, msg_b, cfg, console, sessions, depth)
+        a, b = both(msg_a, msg_b, round_no=n)
         record({"role": "debate", "round": n, "proposer": a, "adversary": b})
         if _moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10:        # deterministic early-stop
             record({"role": "debate", "event": "converged", "round": n})
             break
-    _present(console, a, b)
+    if not cfg.stream_tape:
+        _present(console, a, b)                          # the tape already showed everything live
     result = DebateResult(proposer_final=a, adversary_final=b)
     if judge:
         result = _synthesize(question, result, style=judge, cfg=cfg, console=console)
     return result
 
 
-def _both(msg_a, msg_b, cfg, console, sessions=None, depth=None):
+def _both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0):
     """Both heads concurrently with a live 🟠/🔵 status (block-then-present; columns can't
-    stream-interleave). ^C here lands in the MAIN thread (this spinner loop) while the heads
+    stream-interleave). The classic path (stream_tape=false); round_no is the tape's cue and
+    is ignored here. ^C here lands in the MAIN thread (this spinner loop) while the heads
     run in workers — kill the subprocesses FIRST (their communicate() unblocks, each worker
     finishes via _safe's Cancelled branch), THEN re-raise; otherwise pool.__exit__ blocks
     forever waiting on workers stuck in communicate()."""
@@ -143,6 +150,113 @@ def _safe(fn, msg, cfg, label, sessions=None):
         if sessions is not None:
             sessions.clear(label)
         return f"_({label} unavailable: {e})_"
+
+
+_HEAD_STYLE = {"claude": ("orange1", "Claude"), "codex": ("blue", "Codex")}
+
+
+def _glyph(cfg, head):
+    return cfg.claude_glyph if head == "claude" else cfg.codex_glyph
+
+
+def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0):
+    """The tape (step 5): both heads stream CONCURRENTLY into ONE scroll column —
+    docker-compose-logs, not side-by-side panes (decision 10 Jul). Thinking/tool/retry
+    lines print dim the moment they happen and interleave freely; ANSWER prose buffers
+    per head and commits WHOLE in finish order (prose never interleaves). A Rich Live
+    line at the bottom tracks per-head phase + seconds + $. Critique rounds open with an
+    honestly-labelled rule (⬡ challenges ✳) — the debate reads as the system's thinking,
+    never disguised as claude's own. ^C: kill the heads, drain the workers, re-raise —
+    same contract as _both."""
+    depth = depth or {}
+    q: queue.Queue = queue.Queue()
+    streams = {
+        "claude": partial(proposer_stream, session=sessions,
+                          thinking=depth.get("thinking", 0), tools=depth.get("tools", False)),
+        "codex": partial(adversary_stream, session=sessions,
+                         effort=depth.get("effort"), tools=depth.get("tools", False)),
+    }
+    def worker(label, fn, msg):
+        try:
+            for ev in _safe_stream(fn, msg, cfg, label, sessions):
+                q.put(ev)
+        finally:
+            q.put({"head": label, "kind": "_done", "payload": None, "ts": time.time()})
+    threads = [threading.Thread(target=worker, args=("claude", streams["claude"], msg_a), daemon=True),
+               threading.Thread(target=worker, args=("codex", streams["codex"], msg_b), daemon=True)]
+    if round_no:
+        console.rule(f"[dim]round {round_no} — {cfg.codex_glyph} and {cfg.claude_glyph} "
+                     f"challenge each other[/]", style="dim", align="left")
+    t0 = time.monotonic()
+    finals: dict[str, str] = {}
+    phase = {"claude": "working", "codex": "working"}
+    spent = {"claude": "", "codex": ""}
+    done: set[str] = set()
+    for t in threads:
+        t.start()
+    def status():
+        spin = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
+        parts = []
+        for head in ("claude", "codex"):
+            color, _ = _HEAD_STYLE[head]
+            state = "✓" if head in done else f"{spin} {phase[head]}"
+            parts.append(f"[{color}]{_glyph(cfg, head)}[/] {state}{spent[head]}")
+        return f"{'    '.join(parts)}    [dim]{time.monotonic() - t0:.0f}s · ^C cancels[/]"
+    try:
+        with Live(status(), console=console, refresh_per_second=8, transient=True) as live:
+            while len(done) < 2:
+                try:
+                    ev = q.get(timeout=0.15)
+                except queue.Empty:
+                    live.update(status())
+                    continue
+                head, kind, payload = ev["head"], ev["kind"], ev["payload"]
+                color, name = _HEAD_STYLE.get(head, ("white", head))
+                g = _glyph(cfg, head)
+                if kind == "_done":
+                    done.add(head)
+                elif kind == "text":
+                    phase[head] = "writing"                     # prose buffers; commits on final
+                elif kind == "thinking":
+                    phase[head] = "thinking"
+                    if isinstance(payload, dict) and payload.get("text"):
+                        console.print(f"[dim][{color}]{g}[/] {payload['text'].strip()}[/dim]")
+                    elif isinstance(payload, dict) and payload.get("tokens"):
+                        console.print(f"[dim][{color}]{g}[/] thought for "
+                                      f"{payload['tokens']} tokens (trace hidden headless)[/dim]")
+                elif kind == "tool":
+                    phase[head] = "researching"
+                    console.print(f"[dim][{color}]{g}[/] 🔍 {payload.get('name', '?')}"
+                                  f"({str(payload.get('input', ''))[:80]})[/dim]")
+                elif kind == "retry":
+                    console.print(f"[dim][{color}]{g}[/] ↻ retrying "
+                                  f"(attempt {payload.get('attempt')}) — {payload.get('error', '')}[/dim]")
+                elif kind == "cost":
+                    if isinstance(payload, dict) and payload.get("usd") is not None:
+                        spent[head] = f" ${payload['usd']:.2f}"
+                elif kind == "final":
+                    finals[head] = str(payload)
+                    console.rule(f"[{color}]{g} {name}[/]"
+                                 + (f"  [dim]round {round_no}[/]" if round_no else ""),
+                                 style=color, align="left")
+                    console.print(finals[head])
+                elif kind == "error":
+                    if isinstance(payload, dict) and payload.get("cancelled"):
+                        finals[head] = f"_({head} cancelled)_"
+                    else:
+                        err = (payload or {}).get("error", "?")
+                        finals[head] = f"_({head} unavailable: {err})_"
+                        console.print(f"[red]{g} {head} unavailable — {str(err)[:120]}[/red]")
+                live.update(status())
+    except KeyboardInterrupt:
+        kill_inflight()                     # workers unblock, _safe_stream yields error, _done lands
+        for t in threads:
+            t.join(timeout=5)
+        raise
+    for t in threads:
+        t.join()
+    return (finals.get("claude") or "_(claude unavailable: empty stream)_",
+            finals.get("codex") or "_(codex unavailable: empty stream)_")
 
 
 def _safe_stream(fn, msg, cfg, label, sessions=None):

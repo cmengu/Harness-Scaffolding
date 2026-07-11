@@ -230,7 +230,9 @@ def _claude_events(e: dict, session: HeadSessions | None):
             if isinstance(block, dict) and block.get("type") == "tool_use":
                 yield _ev("claude", "tool", {"name": block.get("name"),
                                              "input": str(block.get("input") or "")[:200]})
-    elif t == "result":
+    elif t == "result" or (t is None and "result" in e):
+        # t None = the block `--output-format json` shape; tolerated so an older CLI (or a
+        # block-era stub) that answers a stream request in one JSON line still lands.
         if session is not None and e.get("session_id"):
             session.claude = str(e["session_id"])
         usd = e.get("total_cost_usd")
@@ -257,12 +259,18 @@ def adversary_stream(message: str, cfg: Config, *, session: HeadSessions | None 
                 "--skip-git-repo-check"]
         if cfg.codex_model:
             argv += ["-m", cfg.codex_model]
+    plain, saw_final = [], False
     for line in _run_lines(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg):
         try:
             e = json.loads(line)
         except json.JSONDecodeError:
+            plain.append(line)               # a non-JSONL codex (or plain-stdout stub)
             continue
-        yield from _codex_stream_events(e, session)
+        for ev in _codex_stream_events(e, session):
+            saw_final = saw_final or ev["kind"] == "final"
+            yield ev
+    if not saw_final and "".join(plain).strip():
+        yield _ev("codex", "final", "".join(plain).strip())
 
 
 def _codex_stream_events(e: dict, session: HeadSessions | None):

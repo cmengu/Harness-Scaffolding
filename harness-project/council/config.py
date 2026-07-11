@@ -46,6 +46,10 @@ class Config:
     solo_thinking_tokens: int = 0
     solo_tools: bool = False
     claude_tools: str = "Read Grep Glob WebSearch WebFetch"   # the allowlist when tools are on (no Bash in v1)
+    # The tape (step 5): duels stream both heads interleaved into one scroll column.
+    stream_tape: bool = True         # false = the classic block-then-present duel
+    claude_glyph: str = "✳"          # gutter mark per head (terminals can't render logos;
+    codex_glyph: str = "⬡"           # ✳ = Anthropic starburst, ⬡ = nearest to the OpenAI knot)
     head_retries: int = 2            # attempts AFTER the first try — spent on TRANSIENT failures only
     retry_base_delay: float = 1.0    # backoff between attempts: 1s → 2s → 4s
     ask_budget_usd: float = 0.0      # ask-mode budget; > 0 = red nag in the turn receipt once crossed
