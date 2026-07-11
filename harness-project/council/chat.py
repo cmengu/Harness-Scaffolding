@@ -150,7 +150,10 @@ def _slash(text: str, renderer, console: Console) -> None:
         _help(cfg, console)
     elif cmd == "/new":
         start_session()                      # fresh memory boundary, same process
-        console.print("— new session — history reset —  [dim](/switch brings the old one back)[/]")
+        was_armed = _disarm(renderer)        # 11 Jul: a new chat starts duel-off
+        console.print("— new session — history reset —"
+                      + ("  ⚔ duel off" if was_armed else "")
+                      + "  [dim](/switch brings the old one back)[/]")
     elif cmd == "/duel":
         import shutil
         renderer.adversarial = {"on": True, "off": False}.get(arg, not renderer.adversarial)
@@ -158,6 +161,8 @@ def _slash(text: str, renderer, console: Console) -> None:
             renderer.adversarial = False     # fail loud, not a one-voiced "debate"
             console.print("[red]✗ codex not found — install @openai/codex first; staying solo[/]")
         else:
+            if not renderer.adversarial and hasattr(renderer, "reset_sessions"):
+                renderer.reset_sessions()    # disarm drops head memory; re-arm reseeds fresh
             console.print("⚔ adversary ON — codex will cross-examine every answer"
                           "  [dim](/duel again to turn off)[/]"
                           if renderer.adversarial else
@@ -185,9 +190,11 @@ def _slash(text: str, renderer, console: Console) -> None:
     elif cmd == "/last":
         _last(console)
     elif cmd == "/switch":
-        _switch(arg, console)
+        if _switch(arg, console) and _disarm(renderer):
+            console.print("[dim]⚔ duel off — new conversation starts solo (/duel re-arms)[/]")
     elif cmd == "/fork":
-        _fork(arg, console)
+        if _fork(arg, console) and _disarm(renderer):
+            console.print("[dim]⚔ duel off — new branch starts solo (/duel re-arms)[/]")
     elif cmd == "/history":
         _history(cfg, console)
     elif cmd == "/model":
@@ -211,6 +218,17 @@ def _slash(text: str, renderer, console: Console) -> None:
         _view(console, cfg, f"run {arg}", lambda: replay(arg, console))
     else:
         console.print(f"[dim]unknown command {text!r} — try /help[/]")
+
+
+def _disarm(renderer) -> bool:
+    """Conversation boundary crossed (/new · /switch · /fork): the duel turns off and the
+    heads' native sessions drop — they belong to the OLD conversation's memory (11 Jul).
+    Returns whether the duel was actually armed, so callers can mention it or stay quiet."""
+    was = getattr(renderer, "adversarial", False)
+    renderer.adversarial = False
+    if hasattr(renderer, "reset_sessions"):
+        renderer.reset_sessions()
+    return was
 
 
 def _view(console: Console, cfg: Config, title: str, render: Callable[[], None]) -> None:
@@ -254,6 +272,13 @@ def _status(renderer, console: Console) -> None:
               f" · {cfg.codex_command}{f' ({cfg.codex_model})' if cfg.codex_model else ''}"
               + (f" · effort {cfg.codex_effort}" if cfg.codex_effort else ""))
     t.add_row("memory", f"last {cfg.history_turns} turns from the ledger")
+    if duel:
+        s = getattr(renderer, "sessions", None)
+        live = s is not None and (s.claude or s.codex)
+        t.add_row("head sessions",
+                  f"live — claude {s.claude or '—'} · codex {s.codex or '—'}" if live
+                  else ("mint on the next message" if cfg.head_sessions
+                        else "off — preamble replay each round"))
     t.add_row("session", f"{RUN_ID} · {_spent():.2f} USD so far")
     console.rule("[bold]status[/]", style=cfg.accent_color, align="left")
     console.print(t)
@@ -317,16 +342,17 @@ def _session_index() -> list[dict]:
     return out[::-1][:20]
 
 
-def _switch(arg: str, console: Console) -> None:
+def _switch(arg: str, console: Console) -> bool:
     """No arg: the conversations table (↔ omnigent _repl.py:5195 — #·id·title·when shape).
     With #/id: splice that conversation's history in front of a fresh session. Works across
     processes for free — the ledger is one file, so a fresh `council ask` can /switch into
-    last week's thread."""
+    last week's thread. Returns True only when a switch actually happened (listing and
+    misses are not a conversation boundary — the caller disarms the duel on True)."""
     index = _session_index()
     if not arg:
         if not index:
             console.print("[dim]no past conversations yet[/]")
-            return
+            return False
         t = Table(title="switch to…", padding=(0, 2))
         for col in ("#", "id", "started", "turns", "title"):
             t.add_column(col, style="dim" if col in ("id", "started") else "")
@@ -335,22 +361,23 @@ def _switch(arg: str, console: Console) -> None:
                       str(s["turns"]), s["title"])
         console.print(t)
         console.print("[dim]/switch <#> or <id> to resume[/]")
-        return
+        return False
     if arg.isdigit():
         i = int(arg) - 1
         if not 0 <= i < len(index):
             console.print(f"[red]no conversation #{arg}[/] — bare /switch lists {len(index)}")
-            return
+            return False
         target = index[i]
     else:
         hits = [s for s in index if s["sid"].startswith(arg)]
         if len(hits) != 1:
             console.print(f"[red]{'ambiguous' if hits else 'unknown'} id {arg!r}[/] — bare /switch lists them")
-            return
+            return False
         target = hits[0]
     start_session(resumes=target["sid"])
     console.print(f"↺ resumed [bold]{target['title']}[/]  [dim]({target['sid']} · {target['turns']} turn(s))[/]")
     _recap(console)
+    return True
 
 
 def _recap(console: Console) -> None:
@@ -368,19 +395,20 @@ def _recap(console: Console) -> None:
     render_rows([rows[last_u]] + answers[-1:], console)   # the question + its FINAL round
 
 
-def _fork(arg: str, console: Console) -> None:
+def _fork(arg: str, console: Console) -> bool:
     """Branch: a new session resuming the CURRENT one — both share history up to here, new
     turns diverge. Return-path message ↔ omnigent _repl.py:5455 (fork switches you in-place;
-    the old id is your way back)."""
+    the old id is your way back). Returns True when a fork happened (see _switch)."""
     segs = sessions()
     if not segs:
         console.print("[dim]nothing to fork yet — this is already a fresh conversation[/]")
-        return
+        return False
     old = segs[-1]["sid"]
     title = arg.strip() or None
     start_session(resumes=old, title=title)
     console.print(f"⑂ forked{f' as [bold]{title}[/]' if title else ''} — same memory, new branch"
                   f"  [dim](/switch {old} returns to the original)[/]")
+    return True
 
 
 def _history(cfg: Config, console: Console) -> None:

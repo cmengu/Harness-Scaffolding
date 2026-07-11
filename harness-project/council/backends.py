@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
+import uuid
+from dataclasses import dataclass
 
 from .config import Config
 from .ledger import record
@@ -18,6 +20,21 @@ You are dispatched in one of two modes (the message makes which clear):
   from pride — converge toward what's correct.
 Return a clear, self-contained response. You have NO tools — reason in text only.
 """
+
+
+@dataclass
+class HeadSessions:
+    """One duel conversation's native head memory (probes 11 Jul: docs/probes-2026-07-11.md).
+    claude = the `--session-id`/`--resume` uuid; codex = the `thread_id` from `exec --json`.
+    None = not yet minted (next call seeds and captures). Owned by DebateRenderer; cleared on
+    disarm / /new / /switch / /fork, and per-head by _safe when a head fails PERMANENTLY —
+    the next duel reseeds from the ledger instead of resuming a corpse."""
+    claude: str | None = None
+    codex: str | None = None
+
+    def clear(self, head: str) -> None:
+        if head in ("claude", "codex"):
+            setattr(self, head, None)
 
 
 class Cancelled(Exception):
@@ -60,14 +77,20 @@ def _classify(exc: Exception) -> str:
     return "permanent"
 
 
-def proposer(message: str, cfg: Config) -> str:
+def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None) -> str:
     """Claude head — the REAL `claude` CLI, headless, NO tools.
     Prompt goes via STDIN: `--allowedTools` is variadic and eats a trailing positional
     prompt as a tool name (live-verified vs claude 2.1.200, 4 Jul 2026).
     `--output-format json` → per-call cost lands in the ledger (fields `result` +
     `total_cost_usd`, live-verified 5 Jul 2026); a parse failure falls back to raw text —
-    cost capture must NEVER kill the head."""
+    cost capture must NEVER kill the head.
+    With a session: first call mints `--session-id`, later calls `--resume` — the head
+    then remembers its own earlier rounds (incl. tool-derived facts) and resumed turns
+    ride the cache at ~5x lower cost (probes 11 Jul)."""
     argv = [cfg.claude_command, "-p", "--output-format", "json", "--allowedTools", ""]
+    if session is not None:
+        argv += ["--resume", session.claude] if session.claude \
+            else ["--session-id", str(uuid.uuid4())]
     if cfg.claude_model:
         argv += ["--model", cfg.claude_model]        # /model claude <name> — shipped verbatim
     raw = _run(argv, cfg, stdin=HEAD_PROMPT + "\n\n" + message)
@@ -76,22 +99,62 @@ def proposer(message: str, cfg: Config) -> str:
         usd = payload.get("total_cost_usd")
         if isinstance(usd, (int, float)) and not isinstance(usd, bool):
             record({"role": "head_cost", "head": "claude", "usd": float(usd)})
+        if session is not None and payload.get("session_id"):
+            session.claude = str(payload["session_id"])   # authoritative id (mint OR resume)
         return str(payload["result"]).strip()
     except (json.JSONDecodeError, KeyError, TypeError):
         return raw
 
 
-def adversary(message: str, cfg: Config) -> str:
+def adversary(message: str, cfg: Config, *, session: HeadSessions | None = None) -> str:
     """Codex head — `codex exec`, headless, read-only sandbox.
     Why codex (not an openai-agents SDK): an unpinned model silently falls back to the Databricks
     gateway; `codex exec` has no such fallback. /model·/effort ride as `-m` and
-    `-c model_reasoning_effort=…` (unquoted — matches what codex receives from a shell user)."""
+    `-c model_reasoning_effort=…` (unquoted — matches what codex receives from a shell user).
+    With a session: `--json` events expose the `thread_id` (thread.started) that
+    `exec resume <id>` continues; `--skip-git-repo-check` because a duel can be armed in
+    any cwd, not just a trusted git repo (probes 11 Jul). Sessionless stays plain-stdout."""
+    if session is not None:
+        if session.codex:
+            argv = [cfg.codex_command, "exec", "resume", session.codex,
+                    "--json", "--skip-git-repo-check"]
+        else:
+            argv = [cfg.codex_command, "exec", "--json", "--sandbox", "read-only",
+                    "--skip-git-repo-check"]
+            if cfg.codex_model:
+                argv += ["-m", cfg.codex_model]      # model is fixed at mint; resume inherits it
+        if cfg.codex_effort:
+            argv += ["-c", f"model_reasoning_effort={cfg.codex_effort}"]
+        return _codex_events(_run(argv + [HEAD_PROMPT + "\n\n" + message], cfg), session)
     argv = [cfg.codex_command, "exec", "--sandbox", "read-only"]
     if cfg.codex_model:
         argv += ["-m", cfg.codex_model]
     if cfg.codex_effort:
         argv += ["-c", f"model_reasoning_effort={cfg.codex_effort}"]
     return _run(argv + [HEAD_PROMPT + "\n\n" + message], cfg)
+
+
+def _codex_events(raw: str, session: HeadSessions) -> str:
+    """`exec --json` JSONL → the answer text, capturing thread_id + token usage on the way.
+    Schema (probes 11 Jul): thread.started{thread_id} · item.completed{item:{type,text}} ·
+    turn.completed{usage}. Codex reports tokens, never dollars — head_cost carries `tokens`.
+    Anything unparseable falls through to raw text: session capture must never kill the head."""
+    texts, usage = [], None
+    for line in raw.splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("type") == "thread.started" and e.get("thread_id"):
+            session.codex = str(e["thread_id"])
+        item = e.get("item") or {}
+        if e.get("type") == "item.completed" and item.get("type") == "agent_message":
+            texts.append(str(item.get("text", "")))
+        if e.get("type") == "turn.completed" and isinstance(e.get("usage"), dict):
+            usage = e["usage"]
+    if usage:
+        record({"role": "head_cost", "head": "codex", "tokens": usage})
+    return "\n\n".join(t for t in texts if t).strip() or raw
 
 
 def _run(argv: list[str], cfg: Config, stdin: str = "") -> str:

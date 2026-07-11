@@ -8,12 +8,13 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from functools import partial
 
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-from .backends import Cancelled, _classify, adversary, kill_inflight, proposer
+from .backends import Cancelled, HeadSessions, _classify, adversary, kill_inflight, proposer
 from .config import Config
 from .ledger import chain_rows, quarantine, record
 
@@ -29,21 +30,31 @@ class DebateResult:
     differ: str | None = None
 
 
-def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | None = None) -> DebateResult:
+def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | None = None,
+        sessions: HeadSessions | None = None, seed: str = "") -> DebateResult:
     """Fan to both heads, cross-critique up to N rounds (early-stop on no movement), present, maybe judge.
-    `judge`: falsy=off · 'moderator'=neutral merge · 'reasoning'=verdict, may escalate. (bool True → 'moderator'.)"""
+    `judge`: falsy=off · 'moderator'=neutral merge · 'reasoning'=verdict, may escalate. (bool True → 'moderator'.)
+    `sessions` = native head memory (11 Jul): rounds ≥1 send ONLY the other voice's answer —
+    a resumed head already remembers the question and its own words. `seed` (history preamble /
+    briefing) rides in front of round 0 only; sessionless critiques keep repeating it, because
+    a stateless head forgets it between subprocesses."""
     console = console or Console()
     if judge is True:
         judge = "moderator"
-    a, b = _both(question, question, cfg, console)                      # round 0 (ANSWER mode)
+    seeded = seed + question
+    a, b = _both(seeded, seeded, cfg, console, sessions)                # round 0 (ANSWER mode)
     record({"role": "debate", "round": 0, "proposer": a, "adversary": b})
     for n in range(1, rounds + 1):
         prev_a, prev_b = a, b
-        # Question stays in EVERY round — without it heads drift into critiquing prose style
-        a, b = _both(
-            f"Question:\n{question}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\nCRITIQUE, then update.",
-            f"Question:\n{question}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\nCRITIQUE, then update.",
-            cfg, console)
+        if sessions is not None:
+            msg_a = f"The other voice said:\n{prev_b}\n\nCRITIQUE, then update your answer."
+            msg_b = f"The other voice said:\n{prev_a}\n\nCRITIQUE, then update your answer."
+        else:
+            # Question (incl. seed) stays in EVERY round — a stateless head otherwise
+            # drifts into critiquing prose style
+            msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\nCRITIQUE, then update."
+            msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\nCRITIQUE, then update."
+        a, b = _both(msg_a, msg_b, cfg, console, sessions)
         record({"role": "debate", "round": n, "proposer": a, "adversary": b})
         if _moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10:        # deterministic early-stop
             record({"role": "debate", "event": "converged", "round": n})
@@ -55,7 +66,7 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     return result
 
 
-def _both(msg_a, msg_b, cfg, console):
+def _both(msg_a, msg_b, cfg, console, sessions=None):
     """Both heads concurrently with a live 🟠/🔵 status (block-then-present; columns can't
     stream-interleave). ^C here lands in the MAIN thread (this spinner loop) while the heads
     run in workers — kill the subprocesses FIRST (their communicate() unblocks, each worker
@@ -63,8 +74,8 @@ def _both(msg_a, msg_b, cfg, console):
     forever waiting on workers stuck in communicate()."""
     with ThreadPoolExecutor(max_workers=2) as pool:
         try:
-            fa = pool.submit(_safe, proposer, msg_a, cfg, "claude")
-            fb = pool.submit(_safe, adversary, msg_b, cfg, "codex")
+            fa = pool.submit(_safe, partial(proposer, session=sessions), msg_a, cfg, "claude", sessions)
+            fb = pool.submit(_safe, partial(adversary, session=sessions), msg_b, cfg, "codex", sessions)
             with Live(_status(fa, fb), console=console, refresh_per_second=8) as live:
                 while not (fa.done() and fb.done()):
                     wait([fa, fb], timeout=0.15)
@@ -75,13 +86,15 @@ def _both(msg_a, msg_b, cfg, console):
         return fa.result(), fb.result()
 
 
-def _safe(fn, msg, cfg, label):
+def _safe(fn, msg, cfg, label, sessions=None):
     """A panelist's mic cutting out shouldn't kill the panel: one head failing → single-voiced + logged.
     Also the per-call flight recorder: label + try/except both live here, so every head call
     (judge included) gets a head_call row with real seconds — errors time-stamped for free.
     TRANSIENT failures get cfg.head_retries more tries with exponential backoff (heads are
     stateless one-shot subprocesses, so a retry is idempotent by construction); a head that
-    stays dead leaves a quarantine postmortem, not just one easy-to-miss ledger row."""
+    stays dead leaves a quarantine postmortem, not just one easy-to-miss ledger row.
+    `sessions`: a head that fails for good gets its native session cleared — the next duel
+    reseeds it from the ledger instead of resuming into the same wreck."""
     t0 = time.monotonic()
     kind, attempts = "permanent", 0
     try:
@@ -113,6 +126,8 @@ def _safe(fn, msg, cfg, label):
                 "secs": round(time.monotonic() - t0, 2), "error": str(e)[:500]})
         record({"role": "head_error", "head": label, "kind": kind, "error": str(e)})
         quarantine(label, e, {"kind": kind, "attempts": attempts, "question": msg})
+        if sessions is not None:
+            sessions.clear(label)
         return f"_({label} unavailable: {e})_"
 
 
@@ -207,18 +222,35 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
     """The /duel two-way branch. adversarial=False (DEFAULT) → plain claude chat, one subprocess,
     cheap turns. adversarial=True → the full 🟠vs🔵 debate. run_loop's /duel flips the flag live;
     it takes effect next turn (handle blocks, so a turn in flight always finishes first).
-    Style from cfg.judge_style (whether/how); family from cfg.heads.judge (who)."""
+    Style from cfg.judge_style (whether/how); family from cfg.heads.judge (who).
+    Owns the duel's HeadSessions: minted on the FIRST armed message (seeded once from the
+    history preamble — the briefing popup replaces that seed later), carried across armed
+    turns, dropped by reset_sessions() (disarm · /new · /switch · /fork)."""
 
     def __init__(self, cfg: Config, console: Console, adversarial: bool = False):
         self.cfg, self.console, self.adversarial = cfg, console, adversarial
+        self.sessions: HeadSessions | None = None
+
+    def reset_sessions(self) -> None:
+        self.sessions = None
 
     def handle(self, user_input: str) -> None:
-        pre = _history_preamble(self.cfg)                       # both branches get the same memory
         if not self.adversarial:                                # SOLO: claude only, with memory
+            pre = _history_preamble(self.cfg)
             with self.console.status("[dim]🟠 claude thinking… (^C cancels)[/]", spinner="dots"):
                 out = _safe(proposer, pre + user_input, self.cfg, "claude")
             record({"role": "debate", "round": 0, "proposer": out, "adversary": None})
             self.console.print(f"[orange1]## 🟠 Claude[/]\n{out}")
             return
-        run(pre + user_input, rounds=self.cfg.rounds,           # DUEL: the full debate engine
-            judge=self.cfg.judge_style, cfg=self.cfg, console=self.console)
+        if self.cfg.head_sessions and self.sessions is None:
+            self.sessions = HeadSessions()
+        s = self.sessions
+        # Seed while UNMINTED, not just on the first call — a ^C-cancelled or failed first
+        # duel leaves empty sessions, and the retry must still carry the back-story. Live
+        # sessions already hold it; reseeding would double the memory.
+        fresh = s is None or (s.claude is None and s.codex is None)
+        run(user_input, rounds=self.cfg.rounds,                 # DUEL: the full debate engine
+            judge=self.cfg.judge_style, cfg=self.cfg, console=self.console,
+            sessions=s, seed=_history_preamble(self.cfg) if fresh else "")
+        if fresh and s is not None and (s.claude or s.codex):
+            record({"role": "head_session", "claude": s.claude, "codex": s.codex})
