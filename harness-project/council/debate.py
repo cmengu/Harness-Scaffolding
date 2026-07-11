@@ -145,6 +145,47 @@ def _safe(fn, msg, cfg, label, sessions=None):
         return f"_({label} unavailable: {e})_"
 
 
+def _safe_stream(fn, msg, cfg, label, sessions=None):
+    """_safe's contract for the streaming pump (step 4): flight-recorder head_call rows,
+    transient retries, quarantine postmortems — event-shaped. A retry restarts the stream
+    and announces itself as a `retry` event, but ONLY while nothing user-visible has
+    streamed yet (text/final): duplicating half an answer is worse than failing. Terminal
+    failure yields one `error` event instead of raising — a dead panelist mid-tape is a
+    line on the tape, not a crash (the tape, step 5, renders it single-voiced)."""
+    from .backends import _ev
+    t0 = time.monotonic()
+    visible = False
+    for attempt in range(max(0, cfg.head_retries) + 1):
+        try:
+            for ev in fn(msg, cfg):
+                visible = visible or ev["kind"] in ("text", "final")
+                yield ev
+            record({"role": "head_call", "head": label, "ok": True, "attempts": attempt + 1,
+                    "secs": round(time.monotonic() - t0, 2), "stream": True})
+            return
+        except Cancelled:
+            record({"role": "head_call", "head": label, "ok": False, "cancelled": True,
+                    "secs": round(time.monotonic() - t0, 2), "stream": True})
+            yield _ev(label, "error", {"cancelled": True})
+            return
+        except Exception as e:
+            kind = _classify(e)
+            if kind == "transient" and attempt < cfg.head_retries and not visible:
+                record({"role": "head_retry", "head": label, "attempt": attempt,
+                        "kind": kind, "error": str(e)[:500]})
+                yield _ev(label, "retry", {"attempt": attempt + 1, "error": str(e)[:200]})
+                time.sleep(cfg.retry_base_delay * 2 ** attempt)
+                continue
+            record({"role": "head_call", "head": label, "ok": False, "stream": True,
+                    "secs": round(time.monotonic() - t0, 2), "error": str(e)[:500]})
+            record({"role": "head_error", "head": label, "kind": kind, "error": str(e)})
+            quarantine(label, e, {"kind": kind, "attempts": attempt + 1, "question": msg})
+            if sessions is not None:
+                sessions.clear(label)
+            yield _ev(label, "error", {"kind": kind, "error": str(e)[:500]})
+            return
+
+
 def _moved(prev, now):  # 0=identical, 1=rewritten. Crude on purpose; never fires at default rounds=1.
     return 1 - difflib.SequenceMatcher(None, prev, now).ratio()
 

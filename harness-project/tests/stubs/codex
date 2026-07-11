@@ -2,12 +2,16 @@
 # Canned codex head. Contract with backends.adversary: prompt arrives as the LAST argv
 # (codex exec style); stdin is explicitly empty and must not be waited on.
 # With --json anywhere in argv, speaks the `exec --json` JSONL schema (probes 11 Jul):
-# thread.started{thread_id} · item.completed agent_message · turn.completed{usage}.
+# thread.started{thread_id} · item.* (reasoning, web_search, agent_message) ·
+# turn.completed{usage}.
 [ -n "$COUNCIL_STUB_ARGV" ] && printf '%s\n' "$@" > "$COUNCIL_STUB_ARGV"
 cat > /dev/null
 for a in "$@"; do [ "$a" = "--json" ] && JSON=1; done
 if [ -n "$JSON" ]; then
   echo '{"type":"thread.started","thread_id":"stub-thread-1"}'
+  echo '{"type":"turn.started"}'
+  echo '{"type":"item.started","item":{"id":"ws_0","type":"web_search","query":"moon"}}'
+  echo '{"type":"item.completed","item":{"id":"r_0","type":"reasoning","text":"STUB REASONING: weighing the cheese hypothesis"}}'
   echo '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"STUB CODEX: disagree - the moon is made of cheese"}}'
   echo '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":5,"reasoning_output_tokens":3}}'
 else

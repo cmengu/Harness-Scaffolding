@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -175,6 +176,162 @@ def _codex_events(raw: str, session: HeadSessions) -> str:
     if usage:
         record({"role": "head_cost", "head": "codex", "tokens": usage})
     return "\n\n".join(t for t in texts if t).strip() or raw
+
+
+# ── the streaming pump (step 4) ─────────────────────────────────────────────────────
+# Events are the product; renderers are guests (ROADMAP). Each head grows a streaming
+# twin yielding plain dicts {head, kind, payload, ts} — JSONL-able, Rich-free — so the
+# CLI tape (consumer #1) and the web SSE view (consumer #2) drink the same stream.
+# kind: thinking | tool | text | final | cost  (+ retry | error added by _safe_stream).
+
+def _ev(head: str, kind: str, payload) -> dict:
+    return {"head": head, "kind": kind, "payload": payload, "ts": time.time()}
+
+
+def proposer_stream(message: str, cfg: Config, *, session: HeadSessions | None = None,
+                    thinking: int = 0, tools: bool = False):
+    """Streaming twin of proposer: `--output-format stream-json --include-partial-messages`
+    (REQUIRES --verbose under -p — probes 11 Jul). Claude's thinking TEXT arrives redacted
+    headless; the pump still forwards the empty deltas (self-healing if a release lifts the
+    redaction) and emits the authoritative token count from message_delta as the pulse."""
+    argv = [cfg.claude_command, "-p", "--output-format", "stream-json",
+            "--include-partial-messages", "--verbose",
+            "--allowedTools", cfg.claude_tools if tools else ""]
+    if session is not None:
+        argv += ["--resume", session.claude] if session.claude \
+            else ["--session-id", str(uuid.uuid4())]
+    if cfg.claude_model:
+        argv += ["--model", cfg.claude_model]
+    env = {"MAX_THINKING_TOKENS": str(thinking)} if thinking > 0 else None
+    for line in _run_lines(argv, cfg, stdin=_head_prompt(tools) + "\n\n" + message, env=env):
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        yield from _claude_events(e, session)
+
+
+def _claude_events(e: dict, session: HeadSessions | None):
+    t = e.get("type")
+    if t == "stream_event":
+        ev = e.get("event") or {}
+        if ev.get("type") == "content_block_delta":
+            d = ev.get("delta") or {}
+            if d.get("type") == "text_delta" and d.get("text"):
+                yield _ev("claude", "text", d["text"])
+            elif d.get("type") == "thinking_delta" and d.get("thinking"):
+                yield _ev("claude", "thinking", {"text": d["thinking"]})
+        elif ev.get("type") == "message_delta":
+            details = (ev.get("usage") or {}).get("output_tokens_details") or {}
+            if details.get("thinking_tokens"):
+                yield _ev("claude", "thinking", {"tokens": details["thinking_tokens"]})
+    elif t == "assistant":       # tool calls ride whole assistant messages, not stream deltas
+        for block in ((e.get("message") or {}).get("content") or []):
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                yield _ev("claude", "tool", {"name": block.get("name"),
+                                             "input": str(block.get("input") or "")[:200]})
+    elif t == "result":
+        if session is not None and e.get("session_id"):
+            session.claude = str(e["session_id"])
+        usd = e.get("total_cost_usd")
+        if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+            record({"role": "head_cost", "head": "claude", "usd": float(usd)})
+            yield _ev("claude", "cost", {"usd": float(usd)})
+        yield _ev("claude", "final", str(e.get("result", "")).strip())
+
+
+def adversary_stream(message: str, cfg: Config, *, session: HeadSessions | None = None,
+                     effort: str | None = None, tools: bool = False):
+    """Streaming twin of adversary: `exec --json` is already line-events on stdout.
+    `model_reasoning_summary=detailed` makes codex's reasoning arrive as READABLE text
+    items (probes 11 Jul) — the glass box's counterweight to claude's redacted thinking."""
+    effort = effort or cfg.codex_effort
+    depth_argv = (["-c", f"model_reasoning_effort={effort}"] if effort else []) \
+        + (["-c", "tools.web_search=true"] if tools else []) \
+        + (["-c", "model_reasoning_summary=detailed"])
+    if session is not None and session.codex:
+        argv = [cfg.codex_command, "exec", "resume", session.codex,
+                "--json", "--skip-git-repo-check"]
+    else:
+        argv = [cfg.codex_command, "exec", "--json", "--sandbox", "read-only",
+                "--skip-git-repo-check"]
+        if cfg.codex_model:
+            argv += ["-m", cfg.codex_model]
+    for line in _run_lines(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg):
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        yield from _codex_stream_events(e, session)
+
+
+def _codex_stream_events(e: dict, session: HeadSessions | None):
+    t = e.get("type")
+    item = e.get("item") or {}
+    if t == "thread.started" and e.get("thread_id") and session is not None:
+        session.codex = str(e["thread_id"])
+    elif t == "item.completed":
+        kind = item.get("type")
+        if kind == "reasoning" and item.get("text"):
+            yield _ev("codex", "thinking", {"text": item["text"]})
+        elif kind == "agent_message":
+            yield _ev("codex", "final", str(item.get("text", "")).strip())
+        elif kind in ("web_search", "command_execution", "file_read"):
+            yield _ev("codex", "tool", {"name": kind,
+                                        "input": str(item.get("query")
+                                                     or item.get("command") or "")[:200]})
+    elif t == "item.started" and item.get("type") == "web_search":
+        yield _ev("codex", "tool", {"name": "web_search",
+                                    "input": str(item.get("query") or "")[:200]})
+    elif t == "turn.completed" and isinstance(e.get("usage"), dict):
+        record({"role": "head_cost", "head": "codex", "tokens": e["usage"]})
+        yield _ev("codex", "cost", {"tokens": e["usage"]})
+    elif t in ("turn.failed", "error"):
+        raise RuntimeError(f"codex turn failed: {str(e)[:300]}")
+
+
+def _run_lines(argv: list[str], cfg: Config, stdin: str = "", env: dict | None = None):
+    """Streaming twin of _run: one subprocess → its stdout, line by line, as a generator.
+    Same contracts: explicit stdin, inflight registry (^C reaches mid-flight heads), and a
+    timeout — here a watchdog timer that KILLS the process at head_timeout, because the
+    consumer thread is inside readline and can't watch a clock. stderr is read after EOF
+    (heads keep it small — codex banners, claude warnings; a >64KB flood would deadlock,
+    accepted). Early generator close (consumer bails) kills the child in the finally."""
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            env={**os.environ, **env} if env else None)
+    with _ILOCK:
+        _INFLIGHT.add(proc)
+    timed_out = threading.Event()
+    watchdog = threading.Timer(cfg.head_timeout,
+                               lambda: (timed_out.set(), proc.kill()))
+    watchdog.start()
+    err = ""
+    try:
+        try:
+            proc.stdin.write(stdin)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass                              # a fast-dying head: the exit check below reports it
+        for line in proc.stdout:
+            yield line
+        err = proc.stderr.read()
+        proc.wait()
+    finally:
+        watchdog.cancel()
+        if proc.poll() is None:               # consumer closed us early — reap the child
+            proc.kill()
+            proc.wait()
+        with _ILOCK:
+            _INFLIGHT.discard(proc)
+            killed = proc in _KILLED
+            _KILLED.discard(proc)
+    if killed:
+        raise Cancelled(f"{argv[0]} killed by ^C")
+    if timed_out.is_set():
+        raise subprocess.TimeoutExpired(argv, cfg.head_timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(f"{argv[0]} exited {proc.returncode}: {(err or '').strip()[-300:]}")
 
 
 def _run(argv: list[str], cfg: Config, stdin: str = "", env: dict | None = None) -> str:

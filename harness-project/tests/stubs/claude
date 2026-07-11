@@ -1,11 +1,23 @@
 #!/bin/sh
 # Canned claude head. Contract with backends.proposer: prompt arrives on STDIN (must be
-# swallowed), stdout is `--output-format json` shaped. Optional capture hooks for tests:
+# swallowed), stdout is `--output-format json` shaped — or stream-json lines when the
+# argv asks for them (backends.proposer_stream). Optional capture hooks for tests:
 #   COUNCIL_STUB_CAPTURE = file to receive the stdin prompt
 #   COUNCIL_STUB_ARGV    = file to receive the argv line
-# session_id mirrors the real CLI's result payload (probes 11 Jul) so session tests can
-# assert mint→resume without a live head.
+#   COUNCIL_STUB_ENV     = file to receive MAX_THINKING_TOKENS
+# session_id mirrors the real CLI's result payload (probes 11 Jul).
 [ -n "$COUNCIL_STUB_ARGV" ] && printf '%s ' "$@" > "$COUNCIL_STUB_ARGV"
 if [ -n "$COUNCIL_STUB_CAPTURE" ]; then cat > "$COUNCIL_STUB_CAPTURE"; else cat > /dev/null; fi
 [ -n "$COUNCIL_STUB_ENV" ] && echo "MAX_THINKING_TOKENS=$MAX_THINKING_TOKENS" > "$COUNCIL_STUB_ENV"
-echo '{"result": "STUB CLAUDE: the moon is made of rock", "total_cost_usd": 0.0042, "session_id": "stub-claude-sid"}'
+for a in "$@"; do [ "$a" = "stream-json" ] && STREAM=1; done
+if [ -n "$STREAM" ]; then
+  echo '{"type":"system","subtype":"init"}'
+  echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":""}}}'
+  echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"STUB CLAUDE: "}}}'
+  echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"WebSearch","input":{"query":"moon"}}]}}'
+  echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"the moon is made of rock"}}}'
+  echo '{"type":"stream_event","event":{"type":"message_delta","delta":{},"usage":{"output_tokens_details":{"thinking_tokens":42}}}}'
+  echo '{"type":"result","result":"STUB CLAUDE: the moon is made of rock","total_cost_usd":0.0042,"session_id":"stub-claude-sid"}'
+else
+  echo '{"result": "STUB CLAUDE: the moon is made of rock", "total_cost_usd": 0.0042, "session_id": "stub-claude-sid"}'
+fi

@@ -1,0 +1,10 @@
+#!/bin/sh
+# First call: dies with a transient-looking error BEFORE emitting anything visible.
+# Second call: hands off to the healthy claude stub. Marker rides COUNCIL_STUB_STATE.
+cat > /dev/null
+if [ ! -f "$COUNCIL_STUB_STATE" ]; then
+  touch "$COUNCIL_STUB_STATE"
+  echo "429 rate limit exceeded" >&2
+  exit 1
+fi
+exec "$(dirname "$0")/claude" "$@" < /dev/null
