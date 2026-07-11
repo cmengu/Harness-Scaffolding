@@ -18,7 +18,7 @@ def render_banner(console: Console, cfg: Config, mode: str) -> None:
     """Paint council's skin once, at launch. Same skin for all 3 modes — only the subtitle
     changes — so the user never sees a different UI when CODE swaps in the hidden Claude Code."""
     subtitle = {
-        "ask":    f"think · {cfg.heads.proposer} · /duel summons {cfg.heads.adversary}"
+        "ask":    f"think · {cfg.heads.proposer} · ⇧Tab or /duel summons {cfg.heads.adversary}"
                   + (f" · judge:{cfg.heads.judge}" if cfg.heads.judge else ""),
         "code":   "code · Claude Code + the-harness  (hidden engine)",
         "attach": "code · reattached to a running hidden engine",

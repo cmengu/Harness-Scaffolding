@@ -51,11 +51,13 @@ class Composer:
 
     def __init__(self, console: Console, *, accent: str, title: str,
                  marker: Callable[[], str], status: Callable[[], str],
-                 commands: list[tuple[str, str, str]], history_path) -> None:
+                 commands: list[tuple[str, str, str]], history_path,
+                 on_toggle: Callable[[], None] | None = None) -> None:
         self.console = console
         self._accent = accent
         self._marker = marker
         self._status = status
+        self._on_toggle = on_toggle          # Shift+Tab: arm/disarm the duel (step 8)
         self._pending_draft = ""             # survives a Ctrl+O overlay trip (see _bindings)
         _install_shift_enter()
         history_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -64,6 +66,7 @@ class Composer:
         self._session = PromptSession(
             multiline=True,                  # buffer ACCEPTS \n; Enter is re-bound to submit
             erase_when_done=True,            # composer vanishes on submit; read() re-echoes
+            refresh_interval=0.5,            # status line ticks while a parked turn runs (step 7)
             history=FileHistory(str(history_path)),
             completer=_SlashCompleter(commands),
             key_bindings=self._bindings(),
@@ -129,6 +132,15 @@ class Composer:
             self._pending_draft = buf.text
             buf.text = "/report"
             buf.validate_and_handle()
+
+        # Shift+Tab (BackTab): the duel toggle (step 8) — the friendlier twin of typing
+        # /duel. The callback prints its own confirmation (patch_stdout routes it above
+        # the prompt); the marker ⚔ › flips on the next render tick.
+        @kb.add("s-tab", eager=True)
+        def _toggle(event) -> None:
+            if self._on_toggle is not None:
+                self._on_toggle()
+                event.app.invalidate()
 
         return kb
 

@@ -16,7 +16,8 @@ from .ledger import RUN_ID, chain_rows, record, sessions, start_session, trace
 
 # One table drives /help AND the completion popup — they can never drift apart.
 _COMMANDS: list[tuple[str, str, str]] = [
-    ("/duel", "[on|off]", "toggle the codex adversary (bare /duel flips it)"),
+    ("/duel", "[on|off]", "toggle the codex adversary (or Shift+Tab; bare /duel flips it)"),
+    ("/note", "<fact>", "hand the heads a fact — no models fire, rides into the next turn"),
     ("/rounds", "N", "debate depth when duelling"),
     ("/judge", "<style>", "off · moderator · reasoning"),
     ("/model", "[head name]", "per-head model override — /model claude opus · /model reset"),
@@ -45,40 +46,112 @@ class Renderer(Protocol):
     def handle(self, user_input: str) -> None: ...
 
 
+_SAFE_MID_TURN = {"/note", "/status", "/cost", "/help"}   # can't corrupt a turn in flight
+
+
 def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
-    """Read → record → dispatch → render, until exit. Two ^C behaviors, by where you are:
-    at the prompt it abandons the draft; mid-turn it CANCELS the turn (kills the head
-    subprocesses) and the unanswered question stays out of memory (_chain_turns holds a
-    question back until a debate row answers it)."""
+    """Read → record → dispatch → render, until exit.
+    On a TTY the composer is PARKED, never blocked (step 7, omnigent's park-and-wake
+    collapsed to one process): the turn runs on a worker thread, the tape prints through
+    prompt_toolkit's patch_stdout (lines land above the prompt), and you keep typing —
+    /note lands mid-duel, a second question queues with a visible chip, one turn in
+    flight at a time. ^C at the prompt abandons the draft; ^C while a turn runs CANCELS
+    it (kills the heads, clears the queue) and the unanswered question stays out of
+    memory (_chain_turns holds a question back until a debate row answers it).
+    Piped/non-TTY runs keep the classic synchronous loop — same inputs, same outputs."""
+    import threading
+    from collections import deque
+
     start_session()                          # memory boundary: the history preamble (G2) only
-    read_input = _make_prompt(renderer, cfg, console)   # reads the chain from this row on
-    try:
+    turn: list = [None]                      # the in-flight worker thread, if any
+    pending: deque[str] = deque()
+
+    def turn_alive() -> bool:
+        return turn[0] is not None and turn[0].is_alive()
+
+    read_input = _make_prompt(renderer, cfg, console, busy=turn_alive)
+    interactive = sys.stdin.isatty()
+    if interactive:
+        renderer.live_status = False         # composer owns the bottom; no Rich Live spinners
+    patch = _patch_stdout() if interactive else None
+
+    def do_turn(text: str) -> None:          # one question, synchronously (whatever thread)
+        record({"role": "user", "text": text})
+        calls_before = len(trace(run_id=RUN_ID, role="head_call"))
+        spent_before = _spent()
+        try:
+            renderer.handle(text)
+        except KeyboardInterrupt:            # only reachable on the synchronous path
+            record({"role": "debate", "event": "cancelled"})
+            console.print("\n[yellow]✗ cancelled — answer discarded, question kept out of memory[/]")
+        else:
+            _turn_line(console, calls_before, spent_before, cfg)
+
+    def worker(text: str) -> None:           # the parked turn: run, then drain the queue
         while True:
-            try:
-                text = read_input().strip()
-            except KeyboardInterrupt:
-                continue                     # Ctrl+C abandons the draft, not the session
-            except EOFError:                 # Ctrl+D (or exhausted piped stdin) leaves
-                break
-            if text in ("/exit", "/quit", "exit", "quit"):
-                break
-            if text.startswith("/"):
-                _slash(text, renderer, console)  # slash commands may mutate renderer state (/duel)
-                continue
-            if not text:
-                continue
-            record({"role": "user", "text": text})
-            calls_before = len(trace(run_id=RUN_ID, role="head_call"))
-            spent_before = _spent()
-            try:
-                renderer.handle(text)
-            except KeyboardInterrupt:
-                record({"role": "debate", "event": "cancelled"})
-                console.print("\n[yellow]✗ cancelled — answer discarded, question kept out of memory[/]")
-            else:
-                _turn_line(console, calls_before, spent_before, cfg)
+            do_turn(text)
+            if not pending:
+                return
+            text = pending.popleft()
+            console.print(f"[dim]▶ next: {text[:60]}[/]")
+
+    try:
+        with patch or _nullctx():
+            while True:
+                try:
+                    text = read_input().strip()
+                except KeyboardInterrupt:
+                    if turn_alive():         # ^C with a turn running = cancel the turn
+                        from .backends import kill_inflight
+                        kill_inflight()
+                        pending.clear()
+                        console.print("[yellow]✗ cancelling the turn — queue cleared[/]")
+                    continue                 # otherwise: abandons the draft, not the session
+                except EOFError:             # Ctrl+D (or exhausted piped stdin) leaves
+                    break
+                if text in ("/exit", "/quit", "exit", "quit"):
+                    break
+                if text.startswith("/"):
+                    if turn_alive() and text.split()[0] not in _SAFE_MID_TURN:
+                        console.print("[dim]turn in flight — /note /status /cost /help work now; "
+                                      "^C cancels the turn[/]")
+                        continue
+                    _slash(text, renderer, console)  # may mutate renderer state (/duel)
+                    continue
+                if not text:
+                    continue
+                if turn_alive():             # one duel in flight; the next question queues
+                    pending.append(text)
+                    console.print(f"[dim]⧗ queued ({len(pending)}): {text[:60]}[/]")
+                    continue
+                if interactive and hasattr(renderer, "prepare_briefing"):
+                    renderer.prepare_briefing(text)   # the popup runs BETWEEN reads, main thread
+                if interactive:
+                    turn[0] = threading.Thread(target=worker, args=(text,), daemon=True)
+                    turn[0].start()
+                else:
+                    do_turn(text)            # piped: the classic synchronous loop
     finally:
+        if turn_alive():
+            from .backends import kill_inflight
+            kill_inflight()
+            turn[0].join(timeout=5)
         _clear_title()
+
+
+def _patch_stdout():
+    """Prints from the worker thread must land ABOVE the live prompt, not through it.
+    raw=True keeps Rich's ANSI styling intact. None (plain loop) if pt is missing."""
+    try:
+        from prompt_toolkit.patch_stdout import patch_stdout
+        return patch_stdout(raw=True)
+    except ImportError:
+        return None
+
+
+def _nullctx():
+    from contextlib import nullcontext
+    return nullcontext()
 
 
 def _turn_line(console: Console, calls_before: int, spent_before: float, cfg: Config) -> None:
@@ -100,7 +173,8 @@ def _turn_line(console: Console, calls_before: int, spent_before: float, cfg: Co
     console.print(f"[dim]{'  ·  '.join(parts)}{f'  ·  ${delta:.2f}' if delta >= 0.005 else ''}{over}[/]")
 
 
-def _make_prompt(renderer, cfg: Config, console: Console) -> Callable[[], str]:
+def _make_prompt(renderer, cfg: Config, console: Console,
+                 busy: Callable[[], bool] = lambda: False) -> Callable[[], str]:
     """The input cockpit (C2): compact composer zone — separator bar, multiline input,
     status line — owned at the bottom while content scrolls natively above; never the
     alternate screen (the omnigent/Claude-Code principle). See composer.py.
@@ -114,7 +188,8 @@ def _make_prompt(renderer, cfg: Config, console: Console) -> Callable[[], str]:
         # Re-read per render tick, so /duel · /rounds · /judge flips show without a redraw.
         # _spent() re-reads the ledger — cheap at solo scale, revisit if the file grows huge.
         duel = "⚔ duel" if getattr(renderer, "adversarial", False) else "solo"
-        return (f" — {cfg.banner_title.lower()} · {duel} · rounds {cfg.rounds}"
+        working = "⏳ turn in flight · " if busy() else ""
+        return (f" — {working}{cfg.banner_title.lower()} · {duel} · rounds {cfg.rounds}"
                 f" · judge {cfg.judge_style or 'off'} · ${_spent():.2f} · ^O report · /help ")
 
     fallback = lambda: console.input(f"[bold {cfg.accent_color}]{marker()}[/] ")
@@ -126,7 +201,8 @@ def _make_prompt(renderer, cfg: Config, console: Console) -> Callable[[], str]:
         return fallback
     return Composer(console, accent=cfg.accent_color, title=cfg.banner_title.lower(),
                     marker=marker, status=status, commands=_COMMANDS,
-                    history_path=cfg.ledger_path.parent / "history").read
+                    history_path=cfg.ledger_path.parent / "history",
+                    on_toggle=lambda: _toggle_duel(renderer, console)).read
 
 
 def _clear_title() -> None:
@@ -157,18 +233,13 @@ def _slash(text: str, renderer, console: Console) -> None:
                       + ("  ⚔ duel off" if was_armed else "")
                       + "  [dim](/switch brings the old one back)[/]")
     elif cmd == "/duel":
-        import shutil
-        renderer.adversarial = {"on": True, "off": False}.get(arg, not renderer.adversarial)
-        if renderer.adversarial and not shutil.which(cfg.codex_command):
-            renderer.adversarial = False     # fail loud, not a one-voiced "debate"
-            console.print("[red]✗ codex not found — install @openai/codex first; staying solo[/]")
-        else:
-            if not renderer.adversarial and hasattr(renderer, "reset_sessions"):
-                renderer.reset_sessions()    # disarm drops head memory; re-arm reseeds fresh
-            console.print("⚔ adversary ON — codex will cross-examine every answer"
-                          "  [dim](/duel again to turn off)[/]"
-                          if renderer.adversarial else
-                          "adversary off — plain claude chat  [dim](/duel to re-arm)[/]")
+        _toggle_duel(renderer, console, arg or None)
+    elif cmd == "/note":
+        if not arg:
+            console.print("[red]usage: /note <fact>[/] — it rides into the next turn as a constraint")
+            return
+        record({"role": "note", "text": arg})
+        console.print("[dim]✎ noted — the heads treat it as a fact next turn[/]")
     elif cmd == "/rounds":
         if not arg.isdigit() or not 0 <= int(arg) <= 6:
             console.print(f"[red]usage: /rounds N (0–6)[/] — now {cfg.rounds}")
@@ -244,6 +315,24 @@ def _slash(text: str, renderer, console: Console) -> None:
         _view(console, cfg, f"run {arg}", lambda: replay(arg, console))
     else:
         console.print(f"[dim]unknown command {text!r} — try /help[/]")
+
+
+def _toggle_duel(renderer, console: Console, arg: str | None = None) -> None:
+    """ONE arming path for /duel and Shift+Tab (step 8): loud codex-missing refusal,
+    session drop on disarm, state echoed with the way back."""
+    import shutil
+    cfg = renderer.cfg
+    renderer.adversarial = {"on": True, "off": False}.get(arg, not renderer.adversarial)
+    if renderer.adversarial and not shutil.which(cfg.codex_command):
+        renderer.adversarial = False         # fail loud, not a one-voiced "debate"
+        console.print("[red]✗ codex not found — install @openai/codex first; staying solo[/]")
+        return
+    if not renderer.adversarial and hasattr(renderer, "reset_sessions"):
+        renderer.reset_sessions()            # disarm drops head memory; re-arm reseeds fresh
+    console.print("⚔ adversary ON — codex will cross-examine every answer"
+                  "  [dim](Shift+Tab or /duel turns it off)[/]"
+                  if renderer.adversarial else
+                  "adversary off — plain claude chat  [dim](Shift+Tab or /duel re-arms)[/]")
 
 
 def _disarm(renderer) -> bool:
