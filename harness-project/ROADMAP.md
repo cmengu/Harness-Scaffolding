@@ -51,8 +51,11 @@ One constraint binds every phase, so it goes first:
      its read-only sandbox + web search enabled. (Under plan B, tools arm in round 0
      only — the research round.)
    - `/think <head> <level|off>` per-head toggle; `/status` shows the depth profile.
-   - Solo turns unchanged: fast, tools-off, cheap.
-   - Done when: both heads visibly research during a duel; solo latency unmoved.
+   - Solo turns DEFAULT fast/tools-off/cheap, but configurable (11 Jul): `solo_thinking`
+     + `solo_tools` config knobs (and `/think solo …`) let the owner arm depth for solo
+     turns too.
+   - Done when: both heads visibly research during a duel; solo defaults unmoved; a
+     config flip demonstrably deepens solo turns.
 
 4. **Streaming pump** (backends grow stream twins; block fns stay for judge/compact)
    - `proposer_stream(msg, cfg) -> Iterator[Event]` + codex twin. Event =
@@ -63,7 +66,9 @@ One constraint binds every phase, so it goes first:
      fake stream stub end-to-end.
 
 5. **The tape** (CLI consumer #1)
-   - One scroll column. Every block gutter-tagged `▌🟠` / `▌🔵`. Thinking + tool lines
+   - One scroll column. Every block gutter-tagged with brand glyphs (11 Jul; terminals
+     can't render image logos): `▌✳` claude (Anthropic starburst, orange) / `▌⬡` codex
+     (nearest to the OpenAI knot, blue-white) — theme-configurable like the banner. Thinking + tool lines
      interleave live in the dim register; ANSWER blocks buffer and commit WHOLE in
      finish order (never interleave prose). Bottom status: per-head phase
      (thinking/tools/writing) + seconds + $.
