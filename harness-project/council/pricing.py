@@ -16,20 +16,29 @@ from __future__ import annotations
 Rate = tuple[float, float, float]   # (input, cached_input, output) — USD per 1M tokens
 
 CODEX_PRICES: dict[str, Rate] = {
-    # codex-line models — the codex CLI pins one of these
+    # older codex-line models — still selectable with -m
     "gpt-5-codex":   (1.25, 0.125, 10.0),
     "gpt-5.1-codex": (1.25, 0.125, 10.0),
     "gpt-5.2-codex": (1.75, 0.175, 14.0),
     "gpt-5.3-codex": (1.75, 0.175, 14.0),
-    # GPT-5.6 general tiers (Sol/Terra/Luna) — reachable with -m if you point codex at them
+    # GPT-5.4 line (credit rates ÷25 → USD; 5.4-mini = the subagent model)
+    "gpt-5.4":       (2.50, 0.25, 15.0),
+    "gpt-5.4-mini":  (0.75, 0.075, 4.52),
+    # GPT-5.5 (late-Apr frontier) — $5/$30, cached $0.50
+    "gpt-5.5":       (5.00, 0.50, 30.0),
+    # GPT-5.6 tiers — Terra is the codex everyday DEFAULT; Sol = polish, Luna = cheap
     "gpt-5.6-sol":   (5.00, 0.50, 30.0),
     "gpt-5.6-terra": (2.50, 0.25, 15.0),
     "gpt-5.6-luna":  (1.00, 0.10,  6.0),
+    # short tier aliases the CLI/UX also accept
+    "sol":           (5.00, 0.50, 30.0),
+    "terra":         (2.50, 0.25, 15.0),
+    "luna":          (1.00, 0.10,  6.0),
 }
 
-# What the codex CLI resolves to when cfg.codex_model is None (probes 13 Jul: codex exec
-# defaults to the gpt-5.3-codex line). Update alongside the CLI's own default.
-DEFAULT_MODEL = "gpt-5.3-codex"
+# What the codex CLI resolves to when cfg.codex_model is None. As of 13 Jul 2026 the codex
+# default (app/CLI/IDE) is the GPT-5.6 "Terra" everyday tier. Update alongside the CLI.
+DEFAULT_MODEL = "gpt-5.6-terra"
 
 
 def codex_rate(model: str | None) -> tuple[Rate, str, bool]:

@@ -79,12 +79,12 @@ def test_hung_head_times_out(monkeypatch):
 
 
 def test_codex_usd_prices_tokens_at_default_model_rate():
-    cfg = load_config()                                  # default model = gpt-5.3-codex: $1.75/$14
+    cfg = load_config()                                  # default model = gpt-5.6-terra: $2.50/$15
     # 1M non-cached input + 1M output = input rate + output rate.
-    assert codex_usd({"input_tokens": 1_000_000, "output_tokens": 1_000_000}, cfg) == 15.75
+    assert codex_usd({"input_tokens": 1_000_000, "output_tokens": 1_000_000}, cfg) == 17.50
     # cached input bills at the 90%-off rate; input_tokens is the full prompt incl. cached.
     assert codex_usd({"input_tokens": 1_000_000, "cached_input_tokens": 1_000_000,
-                      "output_tokens": 0}, cfg) == 0.175
+                      "output_tokens": 0}, cfg) == 0.25
     assert codex_usd({}, cfg) == 0.0                     # no usage → no charge
 
 
@@ -92,10 +92,10 @@ def test_switching_codex_model_reprices_from_the_table(monkeypatch):
     usage = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
     monkeypatch.setenv("COUNCIL_CODEX_MODEL", "gpt-5-codex")     # $1.25/$10
     assert codex_usd(usage, load_config()) == 11.25
-    monkeypatch.setenv("COUNCIL_CODEX_MODEL", "gpt-5.6-sol")     # $5/$30
+    monkeypatch.setenv("COUNCIL_CODEX_MODEL", "gpt-5.5")        # $5/$30
     assert codex_usd(usage, load_config()) == 35.0
     monkeypatch.setenv("COUNCIL_CODEX_MODEL", "gpt-9-imaginary") # unknown → default rate, no crash
-    assert codex_usd(usage, load_config()) == 15.75             # falls back to gpt-5.3-codex
+    assert codex_usd(usage, load_config()) == 17.50            # falls back to gpt-5.6-terra (Terra)
 
 
 def test_codex_pricing_toggle_off_is_token_only(monkeypatch):
@@ -107,11 +107,12 @@ def test_codex_pricing_toggle_off_is_token_only(monkeypatch):
 def test_codex_rate_resolver_exact_prefix_and_fallback():
     from council.pricing import codex_rate
     assert codex_rate("gpt-5.6-terra") == ((2.50, 0.25, 15.0), "gpt-5.6-terra", True)
-    assert codex_rate(None)[1] == "gpt-5.3-codex"                 # CLI default
+    assert codex_rate("gpt-5.5") == ((5.0, 0.50, 30.0), "gpt-5.5", True)
+    assert codex_rate(None)[1] == "gpt-5.6-terra"                 # CLI default = Terra
     rate, model, exact = codex_rate("gpt-5.3-codex-2026-07-01")   # dated suffix → prefix match
     assert model == "gpt-5.3-codex" and exact
     rate, model, exact = codex_rate("some-unknown-model")         # fallback flagged
-    assert model == "gpt-5.3-codex" and exact is False
+    assert model == "gpt-5.6-terra" and exact is False
 
 
 def test_codex_session_path_records_dollar_cost():
