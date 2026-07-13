@@ -17,6 +17,7 @@ import re
 import time
 from pathlib import Path
 
+from ..ledger import is_approval
 from .bridge import (
     _read_complete_lines,
     pane_alive,
@@ -70,7 +71,7 @@ def _read_approval_events(bridge: Path, byte_offset: int) -> tuple[list[dict], i
             row = json.loads(text)
         except json.JSONDecodeError:
             continue
-        if isinstance(row, dict) and row.get("event") in ("approved", "auto"):
+        if is_approval(row):
             rows.append(row)
     return rows, offset
 

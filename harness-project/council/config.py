@@ -63,6 +63,11 @@ class Config:
     claude_model: str | None = None
     codex_model: str | None = None
     codex_effort: str | None = None  # codex -c model_reasoning_effort: minimal·low·medium·high
+    # Codex reports token usage, never dollars (probes 11 Jul) — council prices its tokens
+    # locally from the per-model table in pricing.py, keyed off codex_model above, so
+    # switching /model codex <id> re-prices. False = token-only (show nothing in dollars,
+    # e.g. on a flat-rate subscription where list prices would mislead).
+    codex_pricing: bool = True
     code_budget_usd: float = 0.0     # code-mode session budget; 0 = off. The PreToolUse gate
                                      # ASKs at each crossed multiple (checkpoint ladder).
     # Theme — the banner/prompt skin. GENERIC defaults on purpose: the public repo stays

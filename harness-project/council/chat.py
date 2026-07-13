@@ -15,8 +15,10 @@ from rich.console import Console
 from rich.table import Table
 
 from . import flight
+from . import preamble
 from .config import Config
-from .ledger import RUN_ID, chain_rows, record, sessions, start_session, trace
+from .ledger import (RUN_ID, chain_rows, cost_usd, debate_event, is_answer,
+                     is_user, note, record, sessions, start_session, trace, user)
 
 # One table drives /help AND the completion popup — they can never drift apart.
 _COMMANDS: list[tuple[str, str, str]] = [
@@ -62,7 +64,7 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
     /note lands mid-duel, a second question queues with a visible chip, one turn in
     flight at a time. ^C at the prompt abandons the draft; ^C while a turn runs CANCELS
     it (kills the heads, clears the queue) and the unanswered question stays out of
-    memory (_chain_turns holds a question back until a debate row answers it).
+    memory (preamble.turns holds a question back until a debate row answers it).
     Piped/non-TTY runs keep the classic synchronous loop — same inputs, same outputs."""
     import threading
     from collections import deque
@@ -101,13 +103,13 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
     patch = _patch_stdout() if interactive else None
 
     def do_turn(text: str) -> None:          # one question, synchronously (whatever thread)
-        record({"role": "user", "text": text})
+        record(user(text))
         calls_before = len(trace(run_id=RUN_ID, role="head_call"))
         spent_before = _spent()
         try:
             renderer.handle(text)
         except KeyboardInterrupt:            # only reachable on the synchronous path
-            record({"role": "debate", "event": "cancelled"})
+            record(debate_event("cancelled"))
             console.print("\n[yellow]✗ cancelled — answer discarded, question kept out of memory[/]")
         else:
             _turn_line(console, calls_before, spent_before, cfg)
@@ -321,7 +323,7 @@ def _slash(text: str, renderer, console: Console) -> None:
         if not arg:
             console.print("[red]usage: /note <fact>[/] — it rides into the next turn as a constraint")
             return
-        record({"role": "note", "text": arg})
+        record(note(arg))
         console.print("[dim]✎ noted — the heads treat it as a fact next turn[/]")
     elif cmd == "/rounds":
         if not arg.isdigit() or not 0 <= int(arg) <= 6:
@@ -368,7 +370,7 @@ def _slash(text: str, renderer, console: Console) -> None:
     elif cmd == "/status":
         _status(renderer, console)
     elif cmd == "/cost":
-        _cost(console)
+        _cost(cfg, console)
     elif cmd == "/last":
         _last(cfg, console)
     elif cmd == "/switch":
@@ -501,21 +503,27 @@ def _status(renderer, console: Console) -> None:
     console.print(t)
 
 
-def _cost(console: Console) -> None:
+def _cost(cfg: Config, console: Console) -> None:
+    from .pricing import codex_rate
     calls = trace(run_id=RUN_ID, role="head_call")
-    console.print(f"session {RUN_ID}: [bold]${_spent():.2f}[/] across {len(calls)} head call(s)"
-                  "  [dim](claude head only — codex's CLI exposes no per-call cost)[/]")
+    console.print(f"session {RUN_ID}: [bold]${_spent():.2f}[/] across {len(calls)} head call(s)")
+    if not cfg.codex_pricing:
+        note = "codex priced OFF (token-only)"
+    else:
+        (p_in, _c, p_out), model, exact = codex_rate(cfg.codex_model)
+        assumed = "" if exact else " ⚠ assumed — unknown model, rate may be stale"
+        note = (f"codex @ {model} list ${p_in:g}/${p_out:g} per 1M in/out{assumed}")
+    console.print(f"  [dim]claude billed direct · {note}[/]")
 
 
 def _spent() -> float:
-    return sum(r.get("usd") or 0.0 for r in trace(run_id=RUN_ID, role="head_cost"))
+    return sum(cost_usd(r) for r in trace(run_id=RUN_ID, role="head_cost"))
 
 
 def _last(cfg: Config, console: Console) -> None:
     """Reprint the previous turn — columns for a duel, one voice for solo, verdict if judged.
     The `"proposer" in r` guard skips event rows (converged/cancelled share role=debate)."""
-    turns = [r for r in trace(run_id=RUN_ID, role="debate")
-             if r.get("round") is not None and "proposer" in r]
+    turns = [r for r in trace(run_id=RUN_ID, role="debate") if is_answer(r)]
     if not turns:
         console.print("[dim]nothing yet this session[/]")
         return
@@ -538,16 +546,16 @@ def _last(cfg: Config, console: Console) -> None:
 
 def _session_index() -> list[dict]:
     """Conversations worth listing: sessions with an ANSWERED turn (or a /compact summary —
-    that IS a conversation, condensed). Same answered-only rule as _chain_turns, so the
+    that IS a conversation, condensed). Same answered-only rule as preamble.turns, so the
     table never promises memory that resuming won't deliver (a lone cancelled question,
     abandoned /new markers, bare launches — all hidden). Newest first, capped at 20."""
     out = []
     for seg in sessions():
         answered, pending = [], None
         for r in seg["rows"]:
-            if r.get("role") == "user":
+            if is_user(r):
                 pending = r["text"]
-            elif r.get("role") == "debate" and r.get("round") == 0 and "proposer" in r:
+            elif is_answer(r) and r.get("round") == 0:
                 if pending is not None:
                     answered.append(pending)
                     pending = None
@@ -603,11 +611,10 @@ def _recap(console: Console) -> None:
     summary, rows = chain_rows()
     if summary:
         console.print(f"[dim]memory opens from a compact summary ({len(summary)} chars)[/]")
-    last_u = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].get("role") == "user"), None)
+    last_u = next((i for i in range(len(rows) - 1, -1, -1) if is_user(rows[i])), None)
     if last_u is None:
         return
-    answers = [r for r in rows[last_u + 1:]
-               if r.get("role") == "debate" and r.get("round") is not None and "proposer" in r]
+    answers = [r for r in rows[last_u + 1:] if is_answer(r)]
     from .report import render_rows
     render_rows([rows[last_u]] + answers[-1:], console)   # the question + its FINAL round
 
@@ -771,22 +778,21 @@ def _effort(arg: str, cfg: Config, console: Console) -> None:
 def _context(cfg: Config, console: Console) -> None:
     """How full ask-mode memory is — measured off the REAL preamble the next turn ships,
     not an estimate of one. Coin bar ↔ omnigent _repl.py:5516 (10 slots, block glyphs)."""
-    from .debate import _chain_turns, _history_preamble
-    summary, turns = _chain_turns()
-    if not turns and not summary:
+    summary, flat = preamble.turns()
+    if not flat and not summary:
         console.print("[dim]memory is empty — nothing said yet this conversation[/]")
         return
-    kept = turns[-cfg.history_turns * 2:]
-    turn_text = "\n\n".join(kept)[-8000:]
-    frac = len(turn_text) / 8000
+    kept = preamble.window(flat, cfg)                # the SAME window + clip the heads receive —
+    turn_text = preamble.clip(flat, cfg)             # /context can't drift from what's actually sent
+    frac = len(turn_text) / preamble.WINDOW_CHARS
     bar = "█" * round(frac * 10) + "░" * (10 - round(frac * 10))
     t = Table(show_header=False, box=None, padding=(0, 2))
-    t.add_row("turn window", f"{bar}  {len(turn_text)}/8000 chars ({frac:.0%})")
-    t.add_row("turns", f"{len(kept)} of {len(turns)} rows in the window"
-              f"  [dim](last {cfg.history_turns * 2}; answers clipped at 800 chars/voice)[/]")
+    t.add_row("turn window", f"{bar}  {len(turn_text)}/{preamble.WINDOW_CHARS} chars ({frac:.0%})")
+    t.add_row("turns", f"{len(kept)} of {len(flat)} rows in the window"
+              f"  [dim](last {preamble.window_size(cfg)}; answers clipped at {preamble.VOICE_CHARS} chars/voice)[/]")
     t.add_row("summary", f"{len(summary)} chars from a /compact" if summary else "[dim]none[/]")
-    t.add_row("next turn ships", f"{len(_history_preamble(cfg))} chars of preamble to each head")
-    if frac >= 0.8 or len(turns) > len(kept):
+    t.add_row("next turn ships", f"{len(preamble.preamble(cfg))} chars of preamble to each head")
+    if frac >= 0.8 or len(flat) > len(kept):
         t.add_row("", "[dim]older turns are falling off — /compact folds them into a summary[/]")
     console.print(t)
 
@@ -797,8 +803,8 @@ def _compact(cfg: Config, console: Console) -> None:
     shrinks to one block and the conversation keeps going. Nothing is lost: the old session
     stays in the ledger, /switch brings it back verbatim."""
     from .backends import proposer
-    from .debate import _chain_turns, _safe
-    summary, turns = _chain_turns()
+    from .debate import _safe
+    summary, turns = preamble.turns()
     if not turns and not summary:
         console.print("[dim]nothing to compact yet[/]")
         return
@@ -809,7 +815,7 @@ def _compact(cfg: Config, console: Console) -> None:
               "Write terse notes, not prose.\n\n" + corpus)
     with console.status(f"[dim]⧉ compacting {len(turns)} turn(s)…[/]", spinner="dots"):
         text = _safe(proposer, prompt, cfg, "compact")
-    if text.startswith("_("):    # _safe's failure placeholder — never bake an error into memory
+    if preamble.is_dead(text):   # _safe's failure placeholder — never bake an error into memory
         console.print("[red]✗ compact failed — memory unchanged[/]")
         return
     start_session(summary=text)
