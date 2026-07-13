@@ -1,6 +1,7 @@
 """The persistence seam: record→trace roundtrip, owner-only perms, session chains."""
 from __future__ import annotations
 
+from council import ledger as L
 from council.ledger import (RUN_ID, _cfg, chain_rows, quarantine, record,
                             sessions, start_session, trace)
 
@@ -66,3 +67,49 @@ def test_quarantine_writes_a_readable_postmortem():
     assert (path.parent.stat().st_mode & 0o777) == 0o700
     row = trace(role="quarantined")[0]
     assert row["path"] == str(path) and row["kind"] == "transient"
+
+
+# ── row vocabulary (issue #3): constructors + classifiers are pure functions ─────────
+
+def test_constructor_drops_none_optionals():
+    assert L.run_start("ask") == {"role": "run_start", "mode": "ask"}   # bare row, no null
+    call = L.head_call("claude", ok=True, attempts=2)
+    assert call["role"] == "head_call" and call["ok"] is True and call["attempts"] == 2
+
+
+def test_head_cost_normalizes_both_heads():
+    claude = L.head_cost("claude", usd=0.02)
+    codex = L.head_cost("codex", tokens={"input": 10, "output": 5})
+    assert claude["usd"] == 0.02 and "tokens" not in claude
+    assert codex["tokens"] == {"input": 10, "output": 5} and "usd" not in codex
+    # one reader sums a mixed-head run without special-casing per head:
+    assert L.cost_usd(claude) + L.cost_usd(codex) == 0.02
+    assert L.cost_usd({"role": "note"}) == 0.0
+
+
+def test_classifiers_answer_cost_and_cancel():
+    ans = L.debate_round(1, proposer="the answer", adversary="rebuttal")
+    assert L.is_answer(ans) and not L.is_cost(ans)
+    assert L.is_cost(L.head_cost("claude", usd=1.0))
+    assert not L.is_answer(L.debate_event("converged", round=2))
+    assert L.is_cancelled(L.debate_event("cancelled"))
+    assert L.is_any_user(L.code_user("hi")) and not L.is_user(L.code_user("hi"))
+    assert L.is_approval({"role": "code_approval", "event": "auto"})
+
+
+def test_new_kind_constructors_and_classifiers():
+    parsed = L.trailer("claude", 1, parsed={"position": "yes", "confidence": 0.8})
+    assert L.is_trailer(parsed) and parsed["contract"] == "parsed" and parsed["position"] == "yes"
+    unparsed = L.trailer("codex", 2, raw="{oops")
+    assert unparsed["contract"] == "unparsed" and unparsed["raw"] == "{oops"
+    art = L.artifact("claude", "/tmp/x.html", "Chart")
+    assert L.is_artifact(art) and art["title"] == "Chart" and art["path"] == "/tmp/x.html"
+    assert L.is_round0_agreed(L.round0_agreed(answer="agreed"))
+    assert L.is_unresolved(L.unresolved(3))
+    assert L.is_syco_flag(L.syco_flag("codex", 3, moved=True))
+
+
+def test_constructor_output_roundtrips_through_record():
+    record(L.note("remember this"))                 # a constructor's dict is a drop-in for record()
+    row = trace(role="note")[-1]
+    assert L.is_note(row) and row["text"] == "remember this"

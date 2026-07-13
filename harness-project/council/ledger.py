@@ -134,3 +134,220 @@ def chain_rows() -> tuple[str | None, list[dict]]:
     chain.reverse()                                   # oldest first
     summary = chain[0]["start"].get("summary")        # a /compact row is always a chain END
     return summary, [r for seg in chain for r in seg["rows"]]
+
+
+# ── row vocabulary: constructors + classifiers (expand half of issue #3) ────────────
+# Every KIND of ledger row gets one constructor here; every question a reader asks of a
+# row gets one classifier. Today these live BESIDE the hand-built dict literals at the
+# call sites — nothing is migrated yet, so nothing can break (the contract half, which
+# swaps writers/readers over and deletes the literals, is a later ticket). Constructors
+# are pure: they RETURN a dict for record() to write, they never write, so a caller stays
+#     record(ledger.head_cost("claude", usd=0.02))
+# and a row's shape/spelling is defined in exactly one place instead of retyped at every
+# writer and re-matched as a magic string at every reader.
+
+def _row(role: str, **fields) -> dict:
+    """A row is a role plus fields, with None fields dropped so an omitted optional never
+    writes a null (mirrors start_session's bare-row rule)."""
+    return {"role": role, **{k: v for k, v in fields.items() if v is not None}}
+
+
+# -- run / session / conversation lifecycle --
+def run_start(mode: str, overrides=None) -> dict:
+    return _row("run_start", mode=mode, overrides=list(overrides) if overrides else None)
+
+
+def session_start(session_id: str, **extra) -> dict:
+    return _row("session_start", session_id=session_id, **extra)
+
+
+def user(text: str) -> dict:
+    return _row("user", text=text)
+
+
+def note(text: str) -> dict:
+    return _row("note", text=text)
+
+
+# -- head calls, retries, errors, cost, session handles --
+def head_call(head: str, ok: bool, **fields) -> dict:
+    return _row("head_call", head=head, ok=ok, **fields)
+
+
+def head_retry(head: str, attempt: int, **fields) -> dict:
+    return _row("head_retry", head=head, attempt=attempt, **fields)
+
+
+def head_error(head: str, kind: str, error: str) -> dict:
+    return _row("head_error", head=head, kind=kind, error=error)
+
+
+def head_session(**fields) -> dict:
+    return _row("head_session", **fields)
+
+
+def head_cost(head: str, usd=None, tokens=None) -> dict:
+    """Normalize the two heads' spend onto ONE shape: claude reports dollars, codex reports
+    a token-usage object. Both fields ride on the cost row (the absent one dropped), so a
+    single reader — cost_usd() — sums a mixed run instead of special-casing per head."""
+    return _row("head_cost", head=head,
+                usd=float(usd) if usd is not None else None, tokens=tokens)
+
+
+# -- debate flow --
+def debate_round(round: int, proposer, adversary=None) -> dict:
+    return _row("debate", round=round, proposer=proposer, adversary=adversary)
+
+
+def debate_event(event: str, **fields) -> dict:
+    return _row("debate", event=event, **fields)
+
+
+# -- judge --
+def judge(style: str, text: str) -> dict:
+    return _row("judge", style=style, text=text)
+
+
+def judge_keymap(map: dict) -> dict:
+    return _row("judge_keymap", map=map)
+
+
+# -- persistence / failure bookkeeping --
+def quarantined(head: str, kind, path) -> dict:
+    return _row("quarantined", head=head, kind=kind, path=str(path))
+
+
+# -- briefing / shadow --
+def briefing(choice: str, **fields) -> dict:
+    return _row("briefing", choice=choice, **fields)
+
+
+def run_start_shadow(overrides) -> dict:
+    return _row("run_start", mode="shadow", overrides=list(overrides))
+
+
+def shadow_arm(arm: str, answer, **fields) -> dict:
+    return _row("shadow_arm", arm=arm, answer=answer, **fields)
+
+
+# -- code mode (wrap/) --
+def code_session(event: str, **fields) -> dict:
+    return _row("code_session", event=event, **fields)
+
+
+def code_assistant(text: str) -> dict:
+    return _row("code_assistant", text=text)
+
+
+def code_user(text: str) -> dict:
+    return _row("code_user", text=text)
+
+
+def code_tool(name: str, summary) -> dict:
+    return _row("code_tool", name=name, summary=summary)
+
+
+def code_context(**context) -> dict:
+    return _row("code_context", **context)
+
+
+def code_approval(**row) -> dict:
+    return _row("code_approval", **row)
+
+
+def code_permission(answer, **fields) -> dict:
+    return _row("code_permission", answer=answer, **fields)
+
+
+def state_parse_error(line: str) -> dict:
+    return _row("state_parse_error", line=line)
+
+
+def paste_retry(text: str) -> dict:
+    return _row("paste_retry", text=text)
+
+
+def inject_error(text: str, **fields) -> dict:
+    return _row("inject_error", text=text, **fields)
+
+
+def scrape_advisory(text: str, **fields) -> dict:
+    return _row("scrape_advisory", text=text, **fields)
+
+
+# -- NEW kinds for the output-contract + debate-mechanics tickets. Constructors only: no
+#    writer emits them yet (they land when those tickets migrate). Identifying fields are
+#    fixed; the rest ride as **fields until the consuming ticket firms the shape. --
+def trailer(head: str, round: int, *, parsed: "dict | None" = None,
+            raw: "str | None" = None) -> dict:
+    """The machine-authoritative tail of a contract answer. parsed → validated fields
+    (position/confidence/claims/stances/concessions) with contract='parsed'; raw → the
+    unvalidated text with contract='unparsed' (the degrade-never-die path)."""
+    if parsed is not None:
+        return _row("trailer", head=head, round=round, contract="parsed", **parsed)
+    return _row("trailer", head=head, round=round, contract="unparsed", raw=raw)
+
+
+def artifact(head: str, path, title: str) -> dict:
+    return _row("artifact", head=head, path=str(path), title=title)
+
+
+def round0_agreed(**fields) -> dict:
+    """Round 0's two openings already agreed — the duel ends without an adversarial round."""
+    return _row("round0_agreed", **fields)
+
+
+def unresolved(round: int, **fields) -> dict:
+    """The duel ran its rounds and never converged."""
+    return _row("unresolved", round=round, **fields)
+
+
+def syco_flag(head: str, round: int, **fields) -> dict:
+    """Capitulation: a head moved position with no evidenced REFUTE/SUPPORT behind the move."""
+    return _row("syco_flag", head=head, round=round, **fields)
+
+
+def _is(row, role: str) -> bool:
+    return isinstance(row, dict) and row.get("role") == role
+
+
+def is_run_start(row) -> bool: return _is(row, "run_start")
+def is_user(row) -> bool: return _is(row, "user")
+def is_any_user(row) -> bool: return _is(row, "user") or _is(row, "code_user")
+def is_note(row) -> bool: return _is(row, "note")
+def is_session_start(row) -> bool: return _is(row, "session_start")
+def is_head_call(row) -> bool: return _is(row, "head_call")
+def is_head_error(row) -> bool: return _is(row, "head_error")
+def is_head_retry(row) -> bool: return _is(row, "head_retry")
+def is_cost(row) -> bool: return _is(row, "head_cost")
+def is_code_session(row) -> bool: return _is(row, "code_session")
+def is_code_context(row) -> bool: return _is(row, "code_context")
+
+
+def is_answer(row) -> bool:
+    """'Is this row a proposed answer?' — a debate row with a round set and a proposer,
+    the check report/chat use to reconstruct the conversation."""
+    return _is(row, "debate") and row.get("round") is not None and "proposer" in row
+
+
+def is_cancelled(row) -> bool:
+    return _is(row, "debate") and row.get("event") == "cancelled"
+
+
+def is_approval(row) -> bool:
+    """A code-mode permission that was granted (approved for the session, or auto-allowed)."""
+    return isinstance(row, dict) and row.get("event") in ("approved", "auto")
+
+
+def is_trailer(row) -> bool: return _is(row, "trailer")
+def is_artifact(row) -> bool: return _is(row, "artifact")
+def is_round0_agreed(row) -> bool: return _is(row, "round0_agreed")
+def is_unresolved(row) -> bool: return _is(row, "unresolved")
+def is_syco_flag(row) -> bool: return _is(row, "syco_flag")
+
+
+def cost_usd(row) -> float:
+    """The normalized cost reader: dollars from a head_cost row, 0.0 for anything else, so
+    `sum(cost_usd(r) for r in rows)` totals a mixed-head run. Token-only rows contribute 0
+    until a token→usd rate lands with the consuming ticket."""
+    return float(row.get("usd") or 0.0) if is_cost(row) else 0.0
