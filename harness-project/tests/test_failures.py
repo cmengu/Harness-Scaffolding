@@ -7,7 +7,7 @@ import subprocess
 
 from rich.console import Console
 
-from council import debate
+from council import debate, preamble
 from council.config import load_config
 from council.ledger import trace
 
@@ -63,10 +63,10 @@ def test_safe_marker_uses_friendly_timeout(monkeypatch):
 
 
 def test_is_dead_recognises_only_markers():
-    assert debate._is_dead("_(claude unavailable: boom)_")
-    assert debate._is_dead("_(codex cancelled)_")
-    assert not debate._is_dead("a normal answer")
-    assert not debate._is_dead("_(this trails off")
+    assert preamble.is_dead("_(claude unavailable: boom)_")
+    assert preamble.is_dead("_(codex cancelled)_")
+    assert not preamble.is_dead("a normal answer")
+    assert not preamble.is_dead("_(this trails off")
 
 
 def test_visual_lines_short_circuits_on_huge_paste():

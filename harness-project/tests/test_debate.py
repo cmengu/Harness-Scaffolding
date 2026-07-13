@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from rich.console import Console
 
-from council import debate
+from council import debate, preamble
 from council.config import load_config
 from council.ledger import record, start_session, trace
 
@@ -62,6 +62,6 @@ def test_history_preamble_scopes_to_answered_turns():
     record({"role": "user", "text": "earlier question"})
     record({"role": "debate", "round": 0, "proposer": "earlier answer", "adversary": None})
     record({"role": "user", "text": "current unanswered question"})   # recorded before handle()
-    pre = debate._history_preamble(cfg)
+    pre = preamble.preamble(cfg)
     assert "earlier question" in pre and "earlier answer" in pre
     assert "current unanswered question" not in pre      # never echoed back as fake memory

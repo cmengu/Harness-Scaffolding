@@ -23,9 +23,10 @@ from . import flight
 from .backends import (Cancelled, HeadSessions, _classify, adversary,
                        adversary_stream, kill_inflight, proposer, proposer_stream)
 from .config import Config
-from .ledger import (briefing, chain_rows, debate_event, debate_round, head_call,
-                     head_error, head_retry, head_session, is_answer, is_note,
-                     is_user, judge as judge_row, judge_keymap, quarantine, record)
+from .ledger import (briefing, debate_event, debate_round, head_call, head_error,
+                     head_retry, head_session, judge as judge_row, judge_keymap,
+                     quarantine, record)
+from . import preamble
 
 
 @dataclass
@@ -37,15 +38,6 @@ class DebateResult:
     escalated: bool = False
     agree: str | None = None
     differ: str | None = None
-
-
-def _is_dead(text: str) -> bool:
-    """A head's failure/cancellation marker (the `_(claude unavailable: …)_` convention
-    _safe and the tape both emit). Load-bearing: run() must never feed these to the other
-    head as 'answers' — live-observed 11 Jul, a dead round 0 produced a round 1 of heads
-    earnestly critiquing each other's error messages."""
-    t = text.strip()
-    return t.startswith("_(") and t.endswith(")_")
 
 
 def _err_text(e: Exception, cfg: Config) -> str:
@@ -108,7 +100,7 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         q_a = q_b = seeded
     a, b = both(q_a, q_b, round_no=0)                                   # round 0 (ANSWER mode)
     record(debate_round(0, a, b))
-    dead = [h for h, t in (("claude", a), ("codex", b)) if _is_dead(t)]
+    dead = [h for h, t in (("claude", a), ("codex", b)) if preamble.is_dead(t)]
     if dead:                                # a dead round 0 ends the debate — critiquing a
         record(debate_event("round0_failed", dead=dead))                     # corpse is noise
         if len(dead) == 2:
@@ -133,7 +125,7 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
             msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\n{_CRIT_INSTR}"
             msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\n{_CRIT_INSTR}"
         raw_a, raw_b = both(msg_a, msg_b, round_no=n)
-        died = [h for h, t in (("claude", raw_a), ("codex", raw_b)) if _is_dead(t)]
+        died = [h for h, t in (("claude", raw_a), ("codex", raw_b)) if preamble.is_dead(t)]
         if died:                             # mid-debate death: keep the last GOOD answers
             record(debate_event("round_failed", round=n, dead=died))
             console.print(f"[yellow]⚠ {' and '.join(died)} failed in round {n} — "
@@ -499,56 +491,6 @@ def _synthesize(question, r, *, style, cfg, console, live=True):
     return r
 
 
-def _chain_turns() -> tuple[str | None, list[str]]:
-    """The active chain flattened to preamble-shaped turn strings (+ its /compact summary).
-    Shared by the preamble (slices + caps), /context (measures), /compact (summarizes ALL).
-    A question only becomes history once ANSWERED: a user row is held until a debate row
-    lands after it — so the current question (recorded before handle() runs) and cancelled
-    turns never echo back as fake memory. The `"proposer" in r` guard keeps event rows
-    (converged/cancelled markers share role=debate) from injecting empty CLAUDE: turns."""
-    summary, rows = chain_rows()
-    turns, pending = [], None
-    for r in rows:
-        if is_user(r):
-            pending = f"USER: {r['text']}"
-        elif is_answer(r):
-            if pending:
-                turns.append(pending)
-                pending = None
-            turns.append(f"CLAUDE: {str(r.get('proposer', ''))[:800]}"
-                         + (f"\nCODEX: {str(r['adversary'])[:800]}" if r.get("adversary") else ""))
-    return summary, turns
-
-
-def _pending_notes() -> str:
-    """Notes (/note, 11 Jul) recorded since the last ANSWERED turn, shaped as facts-from-
-    the-boss and prepended to the next message — message-borne, not preamble-borne, so
-    live head sessions (which skip the preamble) receive them too. Consumed by answering:
-    once a debate row lands after them, they're history, not pending."""
-    _, rows = chain_rows()
-    last_answer = max((i for i, r in enumerate(rows) if is_answer(r)), default=-1)
-    notes = [r["text"] for r in rows[last_answer + 1:] if is_note(r)]
-    if not notes:
-        return ""
-    facts = "\n".join(f"- {n}" for n in notes)
-    return f"Facts from the user (constraints — treat as given, not suggestions):\n{facts}\n\n"
-
-
-def _history_preamble(cfg: Config) -> str:
-    """Ask-mode MEMORY. Heads are stateless subprocesses (`claude -p` / `codex exec` die per call),
-    so council rebuilds context every turn from the ledger. This preamble is the ONLY memory the
-    codex head has; it also lets a mid-conversation `/duel on` hand codex the whole back-story.
-    Scope = the ACTIVE CHAIN (ledger.chain_rows): this session plus whatever /switch·/fork spliced
-    in front of it; a /compact summary caps the chain and leads the preamble. Truncated hard —
-    each turn ships this to up to 2 heads × N rounds."""
-    summary, turns = _chain_turns()
-    text = "\n\n".join(turns[-cfg.history_turns * 2:])[-8000:]   # last N turns, ~8k char cap
-    if summary:
-        text = (f"Summary of the conversation so far (from a /compact):\n{summary.strip()[:4000]}"
-                + (f"\n\n{text}" if text else ""))
-    return f"Conversation so far (context — do not re-answer old turns):\n{text}\n\n---\n\n" if text else ""
-
-
 class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
     """The /duel two-way branch. adversarial=False (DEFAULT) → plain claude chat, one subprocess,
     cheap turns. adversarial=True → the full ✳-vs-⬡ debate. run_loop's /duel flips the flag live;
@@ -586,7 +528,7 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
         if not (self.adversarial and self.cfg.head_sessions
                 and (self.sessions is None or self._fresh())):
             return
-        pre = _history_preamble(self.cfg)
+        pre = preamble.preamble(self.cfg)
         if not pre:
             return
         draft_prompt = (f"{pre}A second AI voice is about to join this conversation to debate "
@@ -619,7 +561,7 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
         elif low == "b":
             self.briefing_seed = None                        # the default preamble
         elif low == "c":
-            _, turns = _chain_turns()
+            _, turns = preamble.turns()
             self.briefing_seed = ("Full transcript of the conversation so far:\n"
                                   + "\n\n".join(turns) + "\n\n---\n\n")
         else:                                                # free text = the user's own briefing
@@ -644,9 +586,9 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
         return {0: "a", 1: "b", 2: "c", 3: "custom", None: "a"}[got]   # Esc/^C = default A
 
     def handle(self, user_input: str) -> None:
-        user_input = _pending_notes() + user_input          # /note facts ride EVERY next message
+        user_input = preamble.notes() + user_input          # /note facts ride EVERY next message
         if not self.adversarial:                            # SOLO: claude only, with memory
-            pre = _history_preamble(self.cfg)
+            pre = preamble.preamble(self.cfg)
             solo = partial(proposer, thinking=self.cfg.solo_thinking_tokens,
                            tools=self.cfg.solo_tools)       # fast by default; owner may arm
             g = self.cfg.claude_glyph
@@ -671,7 +613,7 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
         # per head, so the live head never receives it twice.
         reseed = s is None or s.claude is None or s.codex is None
         seed = (self.briefing_seed if fresh and self.briefing_seed is not None
-                else _history_preamble(self.cfg)) if reseed else ""
+                else preamble.preamble(self.cfg)) if reseed else ""
         self.briefing_seed = None                           # one briefing seeds one session
         pre_ids = (s.claude, s.codex) if s is not None else None
         run(user_input, rounds=self.cfg.rounds,             # DUEL: the full debate engine
