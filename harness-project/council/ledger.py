@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -68,6 +69,26 @@ permanent → the command is wrong; check the argv above against the CLI's --hel
 """)
     os.chmod(path, 0o600)
     record(quarantined(head, context.get("kind"), path))
+    return path
+
+
+def save_artifact(head: str, title: str, html: str) -> "os.PathLike":
+    """Persist a duel's self-contained HTML artifact under the run (output-contract.md §artifacts):
+    `~/.council/artifacts/<run_id>/<slug>-<head>.html`. Same privacy stance as the ledger — the
+    file can hold anything a head rendered → dir 0700, file 0600. The `-<head>` suffix keeps the
+    two heads from colliding when they slugify to the same name; returns the path for the row."""
+    from pathlib import Path
+    adir: Path = _cfg().ledger_path.parent / "artifacts" / RUN_ID
+    adir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(adir, 0o700)                     # repair a dir born under an older umask
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40] or "artifact"
+    path = adir / f"{slug}-{head}.html"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, html.encode())
+    finally:
+        os.close(fd)
     return path
 
 

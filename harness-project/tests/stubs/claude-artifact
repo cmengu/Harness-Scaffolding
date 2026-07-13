@@ -1,0 +1,15 @@
+#!/bin/sh
+# Canned claude head that answers a visual question the full contract way: DELIBERATION +
+# CLAIMS + ANSWER + a self-contained HTML ARTIFACT + a clean TRAILER. Speaks both stream-json
+# and block-json. Exercises the tape's thinking-register/claims/confidence render AND the
+# artifact save+open pipeline.
+[ -n "$COUNCIL_STUB_ARGV" ] && printf '%s ' "$@" > "$COUNCIL_STUB_ARGV"
+cat > /dev/null
+ANSWER='=== DELIBERATION ===\nweighing whether a chart helps here\n=== POSITION ===\nA chart is clearest.\n=== CLAIMS ===\n[c1] (conf 0.8) a bar chart shows the split\n=== ANSWER ===\nHere is a chart of the answer.\n=== ARTIFACT ===\n```html\n<html><body><h1>Moon</h1></body></html>\n```\n=== TRAILER ===\n{\"position\": \"chart\", \"confidence\": 0.8}'
+for a in "$@"; do [ "$a" = "stream-json" ] && STREAM=1; done
+if [ -n "$STREAM" ]; then
+  echo '{"type":"system","subtype":"init"}'
+  printf '{"type":"result","result":"%s","total_cost_usd":0.01,"session_id":"stub-claude-sid"}\n' "$ANSWER"
+else
+  printf '{"result":"%s","total_cost_usd":0.01,"session_id":"stub-claude-sid"}\n' "$ANSWER"
+fi

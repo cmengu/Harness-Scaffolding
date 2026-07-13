@@ -17,6 +17,7 @@ from functools import partial
 
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 from rich.table import Table
 
 from . import contract as contract_tpl
@@ -25,9 +26,9 @@ from .backends import (Cancelled, HeadSessions, _classify, adversary,
                        adversary_stream, kill_inflight, proposer, proposer_stream,
                        trailer_retry)
 from .config import Config
-from .ledger import (briefing, debate_event, debate_round, head_call, head_error,
-                     head_retry, head_session, judge as judge_row, judge_keymap,
-                     quarantine, record, trailer as trailer_row)
+from .ledger import (artifact as artifact_row, briefing, debate_event, debate_round,
+                     head_call, head_error, head_retry, head_session, judge as judge_row,
+                     judge_keymap, quarantine, record, save_artifact, trailer as trailer_row)
 from . import preamble
 
 
@@ -89,6 +90,44 @@ def _contract_pass(head, raw, round_no, sessions, cfg, console):
         record(trailer_row(head, round_no, raw=raw_trailer or raw))
         console.print(f"[dim]⚠ {head} trailer unparsed — prose kept, stance features skip[/]")
     return body, parsed
+
+
+def _on_tty() -> bool:
+    return sys.stdout.isatty()
+
+
+def _launch(path) -> None:
+    """Hand the artifact to the platform browser opener. Seam: tests replace this to assert the
+    open fired without spawning a real browser."""
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    try:
+        subprocess.Popen([opener, str(path)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass                                 # no opener on this box: the file + row still landed
+
+
+def _open_artifact(path, cfg) -> None:
+    if cfg.artifact_open and _on_tty():      # headless/remote runs (or the off-switch) never open
+        _launch(path)
+
+
+def _emit_artifact(head, body, question, cfg, console) -> None:
+    """Final-round only (output-contract.md §artifacts): if a head's ANSWER carries a
+    self-contained HTML artifact, save it under the run (0700/0600), record the ledger row
+    (path, title, head), and auto-open it on a TTY behind the artifact_open off-switch. A dead
+    head or an `ARTIFACT: none` is a no-op."""
+    if preamble.is_dead(body):
+        return
+    secs = contract_tpl.sections(contract_tpl.split_trailer(body)[0])
+    html = contract_tpl.artifact_html(secs.get("artifact"))
+    if not html:
+        return
+    title = (secs.get("position") or question or "artifact").splitlines()[0][:60]
+    path = save_artifact(head, title, html)
+    record(artifact_row(head, path, title))
+    console.print(f"[dim]🎨 {head} artifact → {path}[/]")
+    _open_artifact(path, cfg)
 
 
 def _opp_conf(conf_val) -> str:
@@ -188,6 +227,9 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         if _moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10:        # deterministic early-stop
             record(debate_event("converged", round=n))
             break
+    if cfg.contract:                     # final round only: save + open any self-contained artifact
+        _emit_artifact("claude", a, question, cfg, console)
+        _emit_artifact("codex", b, question, cfg, console)
     if not cfg.stream_tape:
         _present(console, a, b, cfg)                     # the tape already showed everything live
     result = DebateResult(proposer_final=a, adversary_final=b)
@@ -410,15 +452,37 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
                         flight.cost(head, float(payload["usd"]))
                 elif kind == "final":
                     finals[head] = str(payload)          # raw back to run(), which re-splits
-                    crit, ans = _split_verdict(finals[head]) if round_no else ("", finals[head])
-                    if crit:                             # scratch work: dim, honestly labelled
-                        box_line(head, f"{name} challenges:")
-                        box_line(head, crit)
-                    close_box()                          # answers stand OUTSIDE the scratch box
-                    console.rule(f"[{color}]{g} {name}[/]"
-                                 + (f"  [dim]round {round_no}[/]" if round_no else ""),
-                                 style=color, align="left")
-                    console.print(ans)
+                    fbody, ftrailer = contract_tpl.split_trailer(finals[head])
+                    fsecs = contract_tpl.sections(fbody) if cfg.contract else {}
+                    if fsecs.get("answer"):
+                        # CONTRACT render: DELIBERATION in the thinking register (the dim box),
+                        # CLAIMS dim, the standalone ANSWER as the deliverable with overall
+                        # confidence on its rule. (⚠ for an unparsed trailer rides the tape from
+                        # run()'s _contract_pass, which owns the authoritative post-retry verdict.)
+                        delib = fsecs.get("deliberation")
+                        if delib and cfg.tape_verbose:
+                            box_line(head, f"{name} deliberates:")
+                            box_line(head, escape(delib))    # model text: never parse as markup
+                        close_box()
+                        for ln in (fsecs.get("claims") or "").splitlines():
+                            if ln.strip():                   # CLAIMS are literally `[id] …` — escape
+                                console.print(f"[dim]  {escape(ln)}[/]")
+                        conf = contract_tpl.confidence(contract_tpl.parse_trailer(ftrailer, round_no))
+                        console.rule(f"[{color}]{g} {name}[/]"
+                                     + (f"  [dim]round {round_no}[/]" if round_no else "")
+                                     + (f"  [dim]conf {conf:.2f}[/]" if conf is not None else ""),
+                                     style=color, align="left")
+                        console.print(fsecs["answer"])
+                    else:                                # LEGACY (contract off / free-form)
+                        crit, ans = _split_verdict(finals[head]) if round_no else ("", finals[head])
+                        if crit:                         # scratch work: dim, honestly labelled
+                            box_line(head, f"{name} challenges:")
+                            box_line(head, crit)
+                        close_box()                      # answers stand OUTSIDE the scratch box
+                        console.rule(f"[{color}]{g} {name}[/]"
+                                     + (f"  [dim]round {round_no}[/]" if round_no else ""),
+                                     style=color, align="left")
+                        console.print(ans)
                 elif kind == "error":
                     if isinstance(payload, dict) and payload.get("cancelled"):
                         finals[head] = f"_({head} cancelled)_"
@@ -499,7 +563,11 @@ def _status(fa, fb, cfg):
 def _present(console, a, b, cfg):
     """Duel output, width-adaptive: side-by-side only when each voice gets readable prose
     width (≥~52 chars/column at 110 cols); narrower terminals get full-width blocks under
-    rule headers — content owns the terminal, not the layout."""
+    rule headers — content owns the terminal, not the layout. This is a DELIVERABLE surface
+    (block-path present, /report answer views, /last): it shows the standalone ANSWER only, so
+    a contract answer's DELIBERATION/CLAIMS/trailer never leak in. Free-form answers pass
+    through unchanged (answer_of returns them whole)."""
+    a, b = contract_tpl.answer_of(a), contract_tpl.answer_of(b)
     ga, gb = cfg.claude_glyph, cfg.codex_glyph
     if console.width >= 110:
         cols = Table.grid(padding=(0, 2))

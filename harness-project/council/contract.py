@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 
 TRAILER_MARK = "=== TRAILER ==="
@@ -158,6 +159,54 @@ def parse_trailer(raw: str | None, round_no: int) -> dict | None:
 def confidence(parsed: dict | None) -> float | None:
     """The overall confidence a parsed trailer carries — None when there is no trailer."""
     return parsed.get("confidence") if isinstance(parsed, dict) else None
+
+
+# ── body-section parsing (tape niceties + deliverable extraction) ───────────────────────────
+# Best-effort only: missing or renamed body sections never fail a round (the contract validates
+# the trailer, not the prose). The tape renders sections richly; the deliverable surfaces show
+# only the ANSWER so DELIBERATION stays a thinking-register concern.
+_SECTION_RE = re.compile(r"^===\s*([A-Za-z]+)\s*===\s*$", re.M)
+
+
+def sections(text: str) -> dict[str, str]:
+    """Split a contract body into its `=== NAME ===` sections, lowercased keys → stripped text.
+    A body with no markers yields {} (free-form answers parse to nothing, unchanged)."""
+    if not text:
+        return {}
+    parts = _SECTION_RE.split(text)     # [preamble, NAME, body, NAME, body, …]
+    out: dict[str, str] = {}
+    it = iter(parts[1:])
+    for name, body in zip(it, it):
+        out[name.lower()] = body.strip()
+    return out
+
+
+def answer_of(text: str) -> str:
+    """The DELIVERABLE view of an answer: the `=== ANSWER ===` section alone, so DELIBERATION,
+    CLAIMS, and the trailer never leak into /report answer views or final-answer excerpts. A
+    free-form (non-contract) answer has no ANSWER marker → returned whole, unchanged."""
+    body, _ = split_trailer(text)
+    return sections(body).get("answer") or body.strip()
+
+
+_HTML_FENCE = re.compile(r"```html\s*\n(.*?)```", re.S | re.I)
+
+
+def artifact_html(section_text: str | None) -> str | None:
+    """The self-contained HTML in an `=== ARTIFACT ===` section, or None when it is `none`
+    / absent / not HTML. Prefers a fenced ```html block; falls back to raw markup if the
+    section is bare HTML. The 'one self-contained file' rule is the contract's, enforced by
+    the template — here we just lift what the head emitted."""
+    if not section_text:
+        return None
+    s = section_text.strip()
+    if not s or s.lower() == "none":
+        return None
+    m = _HTML_FENCE.search(s)
+    if m:
+        html = m.group(1).strip()
+        return html or None
+    return s if ("<" in s and ">" in s) else None
 
 
 # ── the retry schema (native flag: claude --json-schema <inline> · codex --output-schema <file>) ──

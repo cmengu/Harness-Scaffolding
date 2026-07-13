@@ -12,7 +12,9 @@ from pathlib import Path
 
 from rich.console import Console
 
-from council import contract, debate
+import io
+
+from council import contract, debate, report
 from council.backends import HeadSessions
 from council.config import Config, load_config
 from council.ledger import trace
@@ -22,6 +24,11 @@ from conftest import STUBS
 
 def quiet():
     return Console(quiet=True)
+
+
+def taped():
+    buf = io.StringIO()
+    return Console(file=buf, width=100), buf
 
 
 def armed(monkeypatch, **env):
@@ -185,3 +192,86 @@ def test_contract_knob_off_skips_injection_and_trailers(tmp_path, monkeypatch):
                console=quiet(), sessions=HeadSessions())
     assert "--append-system-prompt-file" not in argv.read_text()
     assert trace(role="trailer") == []
+
+
+# ── #8: contract experience — section parsing, tape render, deliverable exclusion, artifacts ──
+CONTRACT_BODY = ("=== DELIBERATION ===\nmy private working\n=== POSITION ===\nrock\n"
+                 "=== ANSWER ===\nThe moon is rock.\n=== TRAILER ===\n"
+                 '{"position": "rock", "confidence": 0.8}')
+
+
+def test_sections_and_answer_of():
+    secs = contract.sections(CONTRACT_BODY)
+    assert secs["deliberation"] == "my private working" and secs["answer"] == "The moon is rock."
+    # answer_of is the deliverable view: ANSWER only, deliberation + trailer stripped
+    assert contract.answer_of(CONTRACT_BODY) == "The moon is rock."
+    assert contract.sections("just prose, no markers") == {}
+    assert contract.answer_of("free-form answer") == "free-form answer"   # non-contract passes through
+
+
+def test_artifact_html_extraction():
+    assert contract.artifact_html("none") is None
+    assert contract.artifact_html(None) is None
+    assert contract.artifact_html("```html\n<h1>Hi</h1>\n```") == "<h1>Hi</h1>"
+    assert contract.artifact_html("<div>bare</div>") == "<div>bare</div>"
+    assert contract.artifact_html("not markup at all") is None
+
+
+def test_tape_renders_deliberation_claims_and_confidence(monkeypatch):
+    armed(monkeypatch)                                       # default streaming tape
+    monkeypatch.setenv("COUNCIL_CLAUDE_COMMAND", str(STUBS / "claude-artifact"))
+    monkeypatch.setenv("COUNCIL_CODEX_COMMAND", str(STUBS / "codex-contract"))
+    console, buf = taped()
+    debate.run("draw the moon", rounds=1, judge=None, cfg=load_config(),
+               console=console, sessions=HeadSessions())
+    out = buf.getvalue()
+    assert "deliberates" in out and "weighing whether a chart helps" in out   # thinking register
+    assert "[c1] (conf 0.8) a bar chart" in out              # CLAIMS rendered dim
+    assert "conf 0.80" in out                                # overall confidence on the ANSWER rule
+
+
+def test_deliberation_excluded_from_report_answer_view():
+    console, buf = taped()
+    row = {"role": "debate", "round": 1, "proposer": CONTRACT_BODY, "adversary": CONTRACT_BODY}
+    report.render_rows([row], console)
+    out = buf.getvalue()
+    assert "my private working" not in out                   # DELIBERATION never in the deliverable
+    assert "The moon is rock." in out                        # …only the standalone ANSWER
+
+
+def test_deliberation_excluded_from_present_excerpt():
+    console, buf = taped()
+    debate._present(console, CONTRACT_BODY, CONTRACT_BODY, load_config())
+    out = buf.getvalue()
+    assert "my private working" not in out and "The moon is rock." in out
+
+
+def test_artifact_saved_recorded_and_opened(monkeypatch):
+    armed(monkeypatch, COUNCIL_STREAM_TAPE="0")
+    monkeypatch.setenv("COUNCIL_CLAUDE_COMMAND", str(STUBS / "claude-artifact"))
+    monkeypatch.setenv("COUNCIL_CODEX_COMMAND", str(STUBS / "codex-contract"))
+    launched = []
+    monkeypatch.setattr(debate, "_on_tty", lambda: True)     # pretend we're on a TTY
+    monkeypatch.setattr(debate, "_launch", lambda p: launched.append(p))
+    debate.run("draw the moon", rounds=1, judge=None, cfg=load_config(),
+               console=quiet(), sessions=HeadSessions())
+    rows = trace(role="artifact")
+    assert len(rows) == 1 and rows[0]["head"] == "claude"    # only the artifact-emitting head
+    path = Path(rows[0]["path"])
+    assert path.exists() and "<h1>Moon</h1>" in path.read_text()
+    assert path.stat().st_mode & 0o777 == 0o600              # ledger file permissions
+    assert launched == [path]                                # opener fired on the TTY
+
+
+def test_artifact_open_offswitch_suppresses_open(monkeypatch):
+    armed(monkeypatch, COUNCIL_STREAM_TAPE="0", COUNCIL_ARTIFACT_OPEN="0")
+    monkeypatch.setenv("COUNCIL_CLAUDE_COMMAND", str(STUBS / "claude-artifact"))
+    monkeypatch.setenv("COUNCIL_CODEX_COMMAND", str(STUBS / "codex-contract"))
+    launched = []
+    monkeypatch.setattr(debate, "_on_tty", lambda: True)
+    monkeypatch.setattr(debate, "_launch", lambda p: launched.append(p))
+    debate.run("draw the moon", rounds=1, judge=None, cfg=load_config(),
+               console=quiet(), sessions=HeadSessions())
+    rows = trace(role="artifact")
+    assert len(rows) == 1 and Path(rows[0]["path"]).exists()  # file + row still land
+    assert launched == []                                     # …but nothing opened

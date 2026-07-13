@@ -50,6 +50,8 @@ class Config:
     # fresh per call. On by default; only armed duels consult it (solo/unarmed never inject), so
     # this is the "default on when armed" knob shadow mode A/B's the whole contract with.
     contract: bool = True
+    artifact_open: bool = True        # auto-open a duel's HTML artifact in the browser (on a TTY);
+                                      # off for headless/remote runs where no opener should fire
     # The tape (step 5): duels stream both heads interleaved into one scroll column.
     stream_tape: bool = True         # false = the classic block-then-present duel
     tape_verbose: bool = True        # show the dim thinking/tool/retry lines (Ctrl+T / /tape flips live)
