@@ -12,7 +12,36 @@ from dataclasses import dataclass
 
 from . import flight
 from .config import Config
-from .ledger import record
+from .ledger import head_cost, record
+
+
+def codex_usd(usage: dict, cfg: Config) -> float:
+    """Price a codex turn locally: its CLI reports tokens, never dollars (probes 11 Jul),
+    so folding codex into one dollar total means multiplying token usage by list rates.
+    Rates are config knobs (codex_price_* — USD per 1M tokens, GPT-5-Codex list by default;
+    all-zero = token-only reporting). input_tokens is the whole prompt incl. cached; the
+    cached slice bills at the discounted rate. reasoning tokens are already inside
+    output_tokens (OpenAI billing), so they are not added a second time."""
+    if not isinstance(usage, dict):
+        return 0.0
+    inp = int(usage.get("input_tokens") or 0)
+    out = int(usage.get("output_tokens") or 0)
+    cached = int(usage.get("cached_input_tokens") or usage.get("cached_input")
+                 or (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0)
+    billed_input = max(0, inp - cached)
+    return round(billed_input / 1e6 * cfg.codex_price_input
+                 + cached / 1e6 * cfg.codex_price_cached
+                 + out / 1e6 * cfg.codex_price_output, 6)
+
+
+def _record_codex_cost(usage: dict, cfg: Config) -> float:
+    """The shared tail of both codex readers (block + stream): price the turn, write its
+    head_cost row (raw tokens for truth, dollars for aggregation), pulse the context meter.
+    Returns the usd so the streaming path can surface it in its live cost event."""
+    usd = codex_usd(usage, cfg)
+    record(head_cost("codex", usd=usd, tokens=usage))
+    _context_beat("codex", usage)
+    return usd
 
 
 def _context_beat(head: str, usage: dict | None) -> None:
@@ -145,7 +174,7 @@ def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None,
         payload = json.loads(raw)
         usd = payload.get("total_cost_usd")
         if isinstance(usd, (int, float)) and not isinstance(usd, bool):
-            record({"role": "head_cost", "head": "claude", "usd": float(usd)})
+            record(head_cost("claude", usd=float(usd)))
         _context_beat("claude", payload.get("usage"))
         if session is not None and payload.get("session_id"):
             session.claude = str(payload["session_id"])   # authoritative id (mint OR resume)
@@ -179,14 +208,14 @@ def adversary(message: str, cfg: Config, *, session: HeadSessions | None = None,
             if cfg.codex_model:
                 argv += ["-m", cfg.codex_model]      # model is fixed at mint; resume inherits it
         return _codex_events(
-            _run(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg), session)
+            _run(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg), session, cfg)
     argv = [cfg.codex_command, "exec", "--sandbox", "read-only"]
     if cfg.codex_model:
         argv += ["-m", cfg.codex_model]
     return _run(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg)
 
 
-def _codex_events(raw: str, session: HeadSessions) -> str:
+def _codex_events(raw: str, session: HeadSessions, cfg: Config) -> str:
     """`exec --json` JSONL → the answer text, capturing thread_id + token usage on the way.
     Schema (probes 11 Jul): thread.started{thread_id} · item.completed{item:{type,text}} ·
     turn.completed{usage}. Codex reports tokens, never dollars — head_cost carries `tokens`.
@@ -205,8 +234,7 @@ def _codex_events(raw: str, session: HeadSessions) -> str:
         if e.get("type") == "turn.completed" and isinstance(e.get("usage"), dict):
             usage = e["usage"]
     if usage:
-        record({"role": "head_cost", "head": "codex", "tokens": usage})
-        _context_beat("codex", usage)
+        _record_codex_cost(usage, cfg)
     return "\n\n".join(t for t in texts if t).strip() or raw
 
 
@@ -270,7 +298,7 @@ def _claude_events(e: dict, session: HeadSessions | None):
         _context_beat("claude", e.get("usage"))
         usd = e.get("total_cost_usd")
         if isinstance(usd, (int, float)) and not isinstance(usd, bool):
-            record({"role": "head_cost", "head": "claude", "usd": float(usd)})
+            record(head_cost("claude", usd=float(usd)))
             yield _ev("claude", "cost", {"usd": float(usd)})
         yield _ev("claude", "final", str(e.get("result", "")).strip())
 
@@ -299,14 +327,14 @@ def adversary_stream(message: str, cfg: Config, *, session: HeadSessions | None 
         except json.JSONDecodeError:
             plain.append(line)               # a non-JSONL codex (or plain-stdout stub)
             continue
-        for ev in _codex_stream_events(e, session):
+        for ev in _codex_stream_events(e, session, cfg):
             saw_final = saw_final or ev["kind"] == "final"
             yield ev
     if not saw_final and "".join(plain).strip():
         yield _ev("codex", "final", "".join(plain).strip())
 
 
-def _codex_stream_events(e: dict, session: HeadSessions | None):
+def _codex_stream_events(e: dict, session: HeadSessions | None, cfg: Config):
     t = e.get("type")
     item = e.get("item") or {}
     if t == "thread.started" and e.get("thread_id") and session is not None:
@@ -325,9 +353,8 @@ def _codex_stream_events(e: dict, session: HeadSessions | None):
         yield _ev("codex", "tool", {"name": "web_search",
                                     "input": str(item.get("query") or "")[:200]})
     elif t == "turn.completed" and isinstance(e.get("usage"), dict):
-        record({"role": "head_cost", "head": "codex", "tokens": e["usage"]})
-        _context_beat("codex", e["usage"])
-        yield _ev("codex", "cost", {"tokens": e["usage"]})
+        usd = _record_codex_cost(e["usage"], cfg)
+        yield _ev("codex", "cost", {"usd": usd, "tokens": e["usage"]})
     elif t in ("turn.failed", "error"):
         raise RuntimeError(f"codex turn failed: {str(e)[:300]}")
 

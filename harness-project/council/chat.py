@@ -16,7 +16,8 @@ from rich.table import Table
 
 from . import flight
 from .config import Config
-from .ledger import RUN_ID, chain_rows, record, sessions, start_session, trace
+from .ledger import (RUN_ID, chain_rows, cost_usd, record, sessions,
+                     start_session, trace)
 
 # One table drives /help AND the completion popup — they can never drift apart.
 _COMMANDS: list[tuple[str, str, str]] = [
@@ -504,11 +505,11 @@ def _status(renderer, console: Console) -> None:
 def _cost(console: Console) -> None:
     calls = trace(run_id=RUN_ID, role="head_call")
     console.print(f"session {RUN_ID}: [bold]${_spent():.2f}[/] across {len(calls)} head call(s)"
-                  "  [dim](claude head only — codex's CLI exposes no per-call cost)[/]")
+                  "  [dim](claude billed direct · codex priced at list rates — /config codex_price_*)[/]")
 
 
 def _spent() -> float:
-    return sum(r.get("usd") or 0.0 for r in trace(run_id=RUN_ID, role="head_cost"))
+    return sum(cost_usd(r) for r in trace(run_id=RUN_ID, role="head_cost"))
 
 
 def _last(cfg: Config, console: Console) -> None:

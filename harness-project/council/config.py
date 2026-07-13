@@ -63,6 +63,12 @@ class Config:
     claude_model: str | None = None
     codex_model: str | None = None
     codex_effort: str | None = None  # codex -c model_reasoning_effort: minimal·low·medium·high
+    # Codex reports token usage, never dollars (probes 11 Jul) — to fold its spend into one
+    # cost total council prices its tokens locally at these list rates (USD per 1M tokens,
+    # GPT-5-Codex default). Edit to match your model/plan; all-zero = token-only codex cost.
+    codex_price_input: float = 1.25
+    codex_price_cached: float = 0.125
+    codex_price_output: float = 10.0
     code_budget_usd: float = 0.0     # code-mode session budget; 0 = off. The PreToolUse gate
                                      # ASKs at each crossed multiple (checkpoint ladder).
     # Theme — the banner/prompt skin. GENERIC defaults on purpose: the public repo stays
