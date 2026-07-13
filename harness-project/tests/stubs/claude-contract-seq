@@ -1,0 +1,14 @@
+#!/bin/sh
+# Parametric contract claude head for the mechanics-trio tests. Its POSITION/answer come from the
+# c-th colon-separated field of COUNCIL_STUB_SEQ (c = prior call count in COUNCIL_STUB_COUNT), so
+# one stub drives round-0 → round-1 → … position dynamics: "rock" (holds), "rock:cheese" (caves),
+# "cheese:rock" (converges). Block-json shape. The trailer carries NO stances, so any move the
+# head makes reads as evidence-free — exactly the capitulation signal the flag keys off.
+: "${COUNCIL_STUB_SEQ:?claude-contract-seq needs COUNCIL_STUB_SEQ}"
+: "${COUNCIL_STUB_COUNT:?claude-contract-seq needs COUNCIL_STUB_COUNT}"
+[ -n "$COUNCIL_STUB_ARGV" ] && printf '%s\n' "$@" >> "$COUNCIL_STUB_ARGV"
+cat > /dev/null
+c=0; [ -f "$COUNCIL_STUB_COUNT" ] && c=$(wc -c < "$COUNCIL_STUB_COUNT" | tr -dc 0-9)
+printf 'x' >> "$COUNCIL_STUB_COUNT"
+POS=$(printf '%s' "$COUNCIL_STUB_SEQ" | awk -F: -v i=$((c + 1)) '{print (i <= NF) ? $i : $NF}')
+printf '{"result":"=== POSITION ===\\n%s\\n=== ANSWER ===\\nRound %s: the moon is %s.\\n=== TRAILER ===\\n{\\"position\\": \\"%s\\", \\"confidence\\": 0.6}","total_cost_usd":0.001,"session_id":"stub-claude-sid"}\n' "$POS" "$c" "$POS" "$POS"

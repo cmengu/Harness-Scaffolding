@@ -13,12 +13,18 @@ template, the slicer, and the validator all unit-test as plain functions.
 from __future__ import annotations
 
 import contextlib
+import difflib
 import json
 import os
 import re
 import tempfile
 
 TRAILER_MARK = "=== TRAILER ==="
+# Normalized position similarity ≥ this = "the two positions agree". Shared by the round-0 router
+# (skip the critique round) and the capitulation flag (moved toward the opponent). Tunable; the
+# ARMOR-MAD agreement share was τ=0.67, but that is a fraction-of-agents metric — for K=2 text we
+# use a similarity threshold, set high enough that only genuinely-restated positions match.
+POSITION_MATCH = 0.75
 
 # ── the community prompt-line pack (docs/debate-techniques-2026-07-12.md), woven into every
 #    critique-round variant: anti-deference, refute-by-reproduction, agreement-without-a-new-
@@ -159,6 +165,43 @@ def parse_trailer(raw: str | None, round_no: int) -> dict | None:
 def confidence(parsed: dict | None) -> float | None:
     """The overall confidence a parsed trailer carries — None when there is no trailer."""
     return parsed.get("confidence") if isinstance(parsed, dict) else None
+
+
+def position_of(parsed: dict | None) -> str:
+    """A parsed trailer's committed position, or "" when there is none. The trailer is the
+    machine-authoritative copy, so the mechanics read the position here, never from prose."""
+    return str(parsed.get("position", "")) if isinstance(parsed, dict) else ""
+
+
+def has_evidenced_stance(parsed: dict | None) -> bool:
+    """True if the trailer commits at least one SUPPORT/REFUTE stance backed by named evidence.
+    The capitulation flag keys off its ABSENCE: a head that moved toward its opponent with no
+    evidenced stance behind the move is the sycophancy signal (docs/debate-techniques A6)."""
+    if not isinstance(parsed, dict):
+        return False
+    return any(s.get("stance") in ("SUPPORT", "REFUTE") and str(s.get("evidence", "")).strip()
+               for s in parsed.get("stances", []) if isinstance(s, dict))
+
+
+# ── shared position similarity (round-0 router + capitulation flag) ─────────────────────────
+def _norm_pos(p: str) -> str:
+    """Normalize a position for comparison: lowercase, punctuation stripped, whitespace collapsed
+    — so 'The moon is rock.' and 'moon  is ROCK' read as the same stance."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (p or "").lower())).strip()
+
+
+def position_similarity(a: str, b: str) -> float:
+    """0..1 similarity of two positions (normalized char ratio). The ONE similarity metric the
+    router and the flag share — a cross-head measure, unlike _moved's per-head self-churn."""
+    na, nb = _norm_pos(a), _norm_pos(b)
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def positions_agree(a: str, b: str, threshold: float = POSITION_MATCH) -> bool:
+    """Do two positions state the same stance? Both non-empty and similar past the threshold."""
+    return bool(a) and bool(b) and position_similarity(a, b) >= threshold
 
 
 # ── body-section parsing (tape niceties + deliverable extraction) ───────────────────────────

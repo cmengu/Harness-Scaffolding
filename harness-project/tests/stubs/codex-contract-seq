@@ -1,0 +1,13 @@
+#!/bin/sh
+# Parametric contract codex head (twin of claude-contract-seq). Position/answer from the c-th
+# field of COUNCIL_CODEX_SEQ (c = prior calls in COUNCIL_CODEX_COUNT — its OWN vars, the two heads
+# run concurrently). --json JSONL (exec --json). No stances → any move reads as evidence-free.
+: "${COUNCIL_CODEX_SEQ:?codex-contract-seq needs COUNCIL_CODEX_SEQ}"
+: "${COUNCIL_CODEX_COUNT:?codex-contract-seq needs COUNCIL_CODEX_COUNT}"
+cat > /dev/null
+c=0; [ -f "$COUNCIL_CODEX_COUNT" ] && c=$(wc -c < "$COUNCIL_CODEX_COUNT" | tr -dc 0-9)
+printf 'x' >> "$COUNCIL_CODEX_COUNT"
+POS=$(printf '%s' "$COUNCIL_CODEX_SEQ" | awk -F: -v i=$((c + 1)) '{print (i <= NF) ? $i : $NF}')
+echo '{"type":"thread.started","thread_id":"stub-thread-1"}'
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"=== POSITION ===\\n%s\\n=== ANSWER ===\\nRound %s: the moon is %s.\\n=== TRAILER ===\\n{\\"position\\": \\"%s\\", \\"confidence\\": 0.7}"}}\n' "$POS" "$c" "$POS" "$POS"
+echo '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":5}}'
