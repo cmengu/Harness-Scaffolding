@@ -6,7 +6,7 @@ import io
 
 from rich.console import Console
 
-from council import chat, debate
+from council import chat, debate, preamble
 from council.config import load_config
 from council.ledger import record, start_session, trace
 
@@ -43,7 +43,7 @@ def test_pending_notes_scope():
     record({"role": "note", "text": "old fact"})
     record({"role": "debate", "round": 0, "proposer": "answered", "adversary": None})
     record({"role": "note", "text": "new fact"})
-    pending = debate._pending_notes()
+    pending = preamble.notes()
     assert "new fact" in pending and "old fact" not in pending
 
 

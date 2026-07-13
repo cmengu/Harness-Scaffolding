@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import flight
+from . import preamble
 from .config import Config
 from .ledger import (RUN_ID, chain_rows, cost_usd, debate_event, is_answer,
                      is_user, note, record, sessions, start_session, trace, user)
@@ -63,7 +64,7 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
     /note lands mid-duel, a second question queues with a visible chip, one turn in
     flight at a time. ^C at the prompt abandons the draft; ^C while a turn runs CANCELS
     it (kills the heads, clears the queue) and the unanswered question stays out of
-    memory (_chain_turns holds a question back until a debate row answers it).
+    memory (preamble.turns holds a question back until a debate row answers it).
     Piped/non-TTY runs keep the classic synchronous loop — same inputs, same outputs."""
     import threading
     from collections import deque
@@ -545,7 +546,7 @@ def _last(cfg: Config, console: Console) -> None:
 
 def _session_index() -> list[dict]:
     """Conversations worth listing: sessions with an ANSWERED turn (or a /compact summary —
-    that IS a conversation, condensed). Same answered-only rule as _chain_turns, so the
+    that IS a conversation, condensed). Same answered-only rule as preamble.turns, so the
     table never promises memory that resuming won't deliver (a lone cancelled question,
     abandoned /new markers, bare launches — all hidden). Newest first, capped at 20."""
     out = []
@@ -777,22 +778,21 @@ def _effort(arg: str, cfg: Config, console: Console) -> None:
 def _context(cfg: Config, console: Console) -> None:
     """How full ask-mode memory is — measured off the REAL preamble the next turn ships,
     not an estimate of one. Coin bar ↔ omnigent _repl.py:5516 (10 slots, block glyphs)."""
-    from .debate import _chain_turns, _history_preamble
-    summary, turns = _chain_turns()
-    if not turns and not summary:
+    summary, flat = preamble.turns()
+    if not flat and not summary:
         console.print("[dim]memory is empty — nothing said yet this conversation[/]")
         return
-    kept = turns[-cfg.history_turns * 2:]
-    turn_text = "\n\n".join(kept)[-8000:]
-    frac = len(turn_text) / 8000
+    kept = preamble.window(flat, cfg)                # the SAME window + clip the heads receive —
+    turn_text = preamble.clip(flat, cfg)             # /context can't drift from what's actually sent
+    frac = len(turn_text) / preamble.WINDOW_CHARS
     bar = "█" * round(frac * 10) + "░" * (10 - round(frac * 10))
     t = Table(show_header=False, box=None, padding=(0, 2))
-    t.add_row("turn window", f"{bar}  {len(turn_text)}/8000 chars ({frac:.0%})")
-    t.add_row("turns", f"{len(kept)} of {len(turns)} rows in the window"
-              f"  [dim](last {cfg.history_turns * 2}; answers clipped at 800 chars/voice)[/]")
+    t.add_row("turn window", f"{bar}  {len(turn_text)}/{preamble.WINDOW_CHARS} chars ({frac:.0%})")
+    t.add_row("turns", f"{len(kept)} of {len(flat)} rows in the window"
+              f"  [dim](last {preamble.window_size(cfg)}; answers clipped at {preamble.VOICE_CHARS} chars/voice)[/]")
     t.add_row("summary", f"{len(summary)} chars from a /compact" if summary else "[dim]none[/]")
-    t.add_row("next turn ships", f"{len(_history_preamble(cfg))} chars of preamble to each head")
-    if frac >= 0.8 or len(turns) > len(kept):
+    t.add_row("next turn ships", f"{len(preamble.preamble(cfg))} chars of preamble to each head")
+    if frac >= 0.8 or len(flat) > len(kept):
         t.add_row("", "[dim]older turns are falling off — /compact folds them into a summary[/]")
     console.print(t)
 
@@ -803,8 +803,8 @@ def _compact(cfg: Config, console: Console) -> None:
     shrinks to one block and the conversation keeps going. Nothing is lost: the old session
     stays in the ledger, /switch brings it back verbatim."""
     from .backends import proposer
-    from .debate import _chain_turns, _safe
-    summary, turns = _chain_turns()
+    from .debate import _safe
+    summary, turns = preamble.turns()
     if not turns and not summary:
         console.print("[dim]nothing to compact yet[/]")
         return
@@ -815,7 +815,7 @@ def _compact(cfg: Config, console: Console) -> None:
               "Write terse notes, not prose.\n\n" + corpus)
     with console.status(f"[dim]⧉ compacting {len(turns)} turn(s)…[/]", spinner="dots"):
         text = _safe(proposer, prompt, cfg, "compact")
-    if text.startswith("_("):    # _safe's failure placeholder — never bake an error into memory
+    if preamble.is_dead(text):   # _safe's failure placeholder — never bake an error into memory
         console.print("[red]✗ compact failed — memory unchanged[/]")
         return
     start_session(summary=text)
