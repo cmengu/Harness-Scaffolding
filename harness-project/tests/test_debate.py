@@ -51,7 +51,7 @@ def test_solo_renderer_records_single_voice():
     cfg = load_config()
     debate.DebateRenderer(cfg, quiet(), adversarial=False).handle("hello")
     rows = [r for r in trace(role="debate") if "proposer" in r]
-    assert len(rows) == 1 and rows[0]["adversary"] is None
+    assert len(rows) == 1 and rows[0].get("adversary") is None   # bare row: null adversary dropped
     assert trace(role="head_call", head="claude")
     assert not trace(role="head_call", head="codex")     # solo = one subprocess, cheap turns
 

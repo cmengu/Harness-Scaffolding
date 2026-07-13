@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import Config, Heads, _apply, load_config
-from .ledger import record
+from .ledger import record, run_start_shadow, shadow_arm
 
 
 def parse_overrides(overrides: tuple[str, ...]) -> dict:
@@ -45,7 +45,7 @@ def run_shadow(prompt: str, overrides: tuple[str, ...], console: Console) -> Non
     data = parse_overrides(overrides)
     cfg_a = load_config()
     cfg_b = apply_overrides(load_config(), data)
-    record({"role": "run_start", "mode": "shadow", "overrides": list(overrides)})
+    record(run_start_shadow(overrides))
     quiet = Console(quiet=True)              # arms render nothing; the comparison is the output
     arms: list[tuple[str, str, str]] = []
     for arm, cfg, label in (("A", cfg_a, "current config"),
@@ -53,8 +53,8 @@ def run_shadow(prompt: str, overrides: tuple[str, ...], console: Console) -> Non
         with console.status(f"[dim]arm {arm} ({label}) thinking…[/]", spinner="dots"):
             r = debate_run(prompt, rounds=cfg.rounds, judge=cfg.judge_style, cfg=cfg, console=quiet)
         answer = r.synthesis or r.proposer_final
-        record({"role": "shadow_arm", "arm": arm, "answer": answer,
-                "overrides": list(overrides) if arm == "B" else []})
+        record(shadow_arm(arm, answer,
+                          overrides=list(overrides) if arm == "B" else []))
         arms.append((arm, label, answer))
     _present_arms(console, arms)
 

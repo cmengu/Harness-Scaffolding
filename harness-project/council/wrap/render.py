@@ -16,7 +16,8 @@ from pathlib import Path
 from rich.console import Console
 
 from ..config import Config
-from ..ledger import record
+from ..ledger import (code_approval, code_assistant, code_context, code_tool,
+                      code_user, record)
 
 
 class Renderer:
@@ -84,17 +85,17 @@ class Renderer:
             return                              # ledgered these rows)
         if kind == "assistant_text":
             self._transcript_finals += 1
-            record({"role": "code_assistant", "text": item["text"]})
+            record(code_assistant(item["text"]))
             if self._transcript_finals > self._streamed_finals:
                 # No delta stream covered this message (MessageDisplay hook missing/off) —
                 # the transcript is authoritative, so paint it now rather than drop it.
                 self._streamed_finals = self._transcript_finals
                 self.console.print(f"\n[orange1]{self.cfg.claude_glyph}[/] {item['text']}")
         elif kind == "user_text":
-            record({"role": "code_user", "text": item["text"]})
+            record(code_user(item["text"]))
         elif kind == "tool_use":
             summary = _tool_summary(item)
-            record({"role": "code_tool", "name": item["name"], "summary": summary})
+            record(code_tool(item["name"], summary))
             self.console.print(f"[dim]⚙ {item['name']}  {summary}[/]")
 
     def _replay_item(self, item: dict) -> None:
@@ -111,7 +112,7 @@ class Renderer:
             self.console.print(f"[dim]⚙ {item['name']}  {_tool_summary(item)}[/]")
 
     def _handle_context(self, context: dict) -> None:
-        record({"role": "code_context", **context})
+        record(code_context(**context))
         cost = context.get("total_cost_usd")
         model = context.get("model")
         pct = context.get("used_percentage")
@@ -126,7 +127,7 @@ class Renderer:
     def _handle_approval(self, row: dict) -> None:
         """Council-side visibility for the hook's decisions — and the ONE place they reach
         the ledger (the hook process has its own random RUN_ID, so it never writes)."""
-        record({"role": "code_approval", **row})
+        record(code_approval(**row))
         key = str(row.get("key", ""))
         label = key.removeprefix("cmd:")
         if key.startswith("budget-"):

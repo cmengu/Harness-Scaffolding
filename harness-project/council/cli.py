@@ -35,8 +35,8 @@ def ask(question, prompt, rounds, judge, duel):
         cfg.rounds = rounds        # CLI flags must reach EVERY turn, not just
     if judge is not None:
         cfg.judge_style = judge    # the first — the renderer reads cfg each turn
-    from .ledger import record
-    record({"role": "run_start", "mode": "ask"})      # the run's header row — report/show thread on it
+    from .ledger import record, run_start, user
+    record(run_start("ask"))                          # the run's header row — report/show thread on it
     render_banner(console, cfg, "ask")
     from .chat import run_loop                        # G1 loop
     from .debate import DebateRenderer                # G2 seam
@@ -45,7 +45,7 @@ def ask(question, prompt, rounds, judge, duel):
     if q:                                             # one-shot: answer once (solo or duel) and exit
         from .ledger import start_session
         start_session()                               # else _history_preamble inherits the PREVIOUS
-        record({"role": "user", "text": q})           # session's tail as stale "memory"
+        record(user(q))                               # session's tail as stale "memory"
         renderer.handle(q)
     else:
         run_loop(renderer, cfg, console)              # DEFAULT: interactive chat; /duel toggles codex
@@ -62,8 +62,8 @@ def code(resume, claude_command, claude_args):
     if sys.platform == "win32":
         raise click.ClickException("council code needs a PTY (macOS/Linux).")
     cfg = load_config()
-    from .ledger import record
-    record({"role": "run_start", "mode": "code"})
+    from .ledger import record, run_start
+    record(run_start("code"))
     render_banner(console, cfg, "code")
     from .wrap.session import run_claude_session     # G3 seam
     run_claude_session(
@@ -117,8 +117,8 @@ def attach(bridge_id):
         console.print(t)
         console.print("[dim]council attach <id> to pick one[/]")
         return
-    from .ledger import record as _record
-    _record({"role": "run_start", "mode": "code"})
+    from .ledger import record as _record, run_start
+    _record(run_start("code"))
     render_banner(console, cfg, "attach")
     from .wrap.session import attach_claude_session
     attach_claude_session(bridge, cfg)

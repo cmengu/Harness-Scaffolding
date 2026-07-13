@@ -16,8 +16,8 @@ from rich.table import Table
 
 from . import flight
 from .config import Config
-from .ledger import (RUN_ID, chain_rows, cost_usd, record, sessions,
-                     start_session, trace)
+from .ledger import (RUN_ID, chain_rows, cost_usd, debate_event, is_answer,
+                     is_user, note, record, sessions, start_session, trace, user)
 
 # One table drives /help AND the completion popup — they can never drift apart.
 _COMMANDS: list[tuple[str, str, str]] = [
@@ -102,13 +102,13 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
     patch = _patch_stdout() if interactive else None
 
     def do_turn(text: str) -> None:          # one question, synchronously (whatever thread)
-        record({"role": "user", "text": text})
+        record(user(text))
         calls_before = len(trace(run_id=RUN_ID, role="head_call"))
         spent_before = _spent()
         try:
             renderer.handle(text)
         except KeyboardInterrupt:            # only reachable on the synchronous path
-            record({"role": "debate", "event": "cancelled"})
+            record(debate_event("cancelled"))
             console.print("\n[yellow]✗ cancelled — answer discarded, question kept out of memory[/]")
         else:
             _turn_line(console, calls_before, spent_before, cfg)
@@ -322,7 +322,7 @@ def _slash(text: str, renderer, console: Console) -> None:
         if not arg:
             console.print("[red]usage: /note <fact>[/] — it rides into the next turn as a constraint")
             return
-        record({"role": "note", "text": arg})
+        record(note(arg))
         console.print("[dim]✎ noted — the heads treat it as a fact next turn[/]")
     elif cmd == "/rounds":
         if not arg.isdigit() or not 0 <= int(arg) <= 6:
@@ -522,8 +522,7 @@ def _spent() -> float:
 def _last(cfg: Config, console: Console) -> None:
     """Reprint the previous turn — columns for a duel, one voice for solo, verdict if judged.
     The `"proposer" in r` guard skips event rows (converged/cancelled share role=debate)."""
-    turns = [r for r in trace(run_id=RUN_ID, role="debate")
-             if r.get("round") is not None and "proposer" in r]
+    turns = [r for r in trace(run_id=RUN_ID, role="debate") if is_answer(r)]
     if not turns:
         console.print("[dim]nothing yet this session[/]")
         return
@@ -553,9 +552,9 @@ def _session_index() -> list[dict]:
     for seg in sessions():
         answered, pending = [], None
         for r in seg["rows"]:
-            if r.get("role") == "user":
+            if is_user(r):
                 pending = r["text"]
-            elif r.get("role") == "debate" and r.get("round") == 0 and "proposer" in r:
+            elif is_answer(r) and r.get("round") == 0:
                 if pending is not None:
                     answered.append(pending)
                     pending = None
@@ -611,11 +610,10 @@ def _recap(console: Console) -> None:
     summary, rows = chain_rows()
     if summary:
         console.print(f"[dim]memory opens from a compact summary ({len(summary)} chars)[/]")
-    last_u = next((i for i in range(len(rows) - 1, -1, -1) if rows[i].get("role") == "user"), None)
+    last_u = next((i for i in range(len(rows) - 1, -1, -1) if is_user(rows[i])), None)
     if last_u is None:
         return
-    answers = [r for r in rows[last_u + 1:]
-               if r.get("role") == "debate" and r.get("round") is not None and "proposer" in r]
+    answers = [r for r in rows[last_u + 1:] if is_answer(r)]
     from .report import render_rows
     render_rows([rows[last_u]] + answers[-1:], console)   # the question + its FINAL round
 

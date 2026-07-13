@@ -10,8 +10,10 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from .ledger import (cost_usd, is_head_call, is_head_error, is_head_retry,
-                     trace)
+from .ledger import (cost_usd, is_answer, is_any_user, is_cancelled,
+                     is_code_assistant, is_code_context, is_code_session,
+                     is_code_tool, is_head_call, is_head_error, is_head_retry,
+                     is_judge, is_quarantined, is_run_start, is_shadow_arm, trace)
 
 
 def summary(days: int = 7):
@@ -49,7 +51,7 @@ def summary(days: int = 7):
         errors = sum(1 for r in rs if is_head_error(r))
         cost = sum(cost_usd(r) for r in rs) + (_code_total(rs) or 0.0)
         per.add_row(rid, time.strftime("%d %b %H:%M", time.localtime(rs[0].get("ts", 0))), _mode(rs),
-                    str(sum(1 for r in rs if r.get("role") in ("user", "code_user"))),
+                    str(sum(1 for r in rs if is_any_user(r))),
                     f"${cost:.2f}" if cost else "—", str(errors) if errors else "—")
     return Group(Rule(f"last {days} day(s)", style="dim", align="left"), top, per)
 
@@ -74,30 +76,29 @@ def render_rows(rows: list[dict], console: Console) -> None:
     from .debate import _present                     # lazy: avoids a module cycle at import
     cfg = load_config()                              # glyphs only — no runtime knob reaches here
     for r in rows:
-        role = r.get("role")
-        if role in ("user", "code_user"):
+        if is_any_user(r):
             console.print(f"\n[bold]› {r.get('text', '')}[/]")
-        elif role == "debate" and r.get("event") == "cancelled":
+        elif is_cancelled(r):
             console.print("[yellow]✗ turn cancelled[/]")
-        elif role == "debate" and r.get("round") is not None and "proposer" in r:
+        elif is_answer(r):
             if r.get("adversary"):
                 _present(console, str(r.get("proposer", "")), str(r["adversary"]), cfg)
             else:
                 console.print(f"[orange1]## {cfg.claude_glyph} Claude[/]\n{r.get('proposer', '')}")
-        elif role == "judge":
+        elif is_judge(r):
             console.print(f"\n[bold]## ⚖ Synthesis[/] ({r.get('style')})\n{r.get('text', '')}")
-        elif role == "code_assistant":
+        elif is_code_assistant(r):
             console.print(f"[orange1]{r.get('text', '')}[/]")
-        elif role == "code_tool":
+        elif is_code_tool(r):
             console.print(f"[dim]⚙ {r.get('name')}  {r.get('summary', '')}[/]")
         elif is_head_retry(r):
             console.print(f"[dim]↻ {r.get('head')} retry {r.get('attempt', 0) + 1}"
                           f" ({r.get('kind')}): {str(r.get('error'))[:120]}[/]")
         elif is_head_error(r):
             console.print(f"[red]✗ {r.get('head')}: {str(r.get('error'))[:200]}[/]")
-        elif role == "quarantined":
+        elif is_quarantined(r):
             console.print(f"[red]☠ postmortem → {r.get('path')}[/]")
-        elif role == "shadow_arm":
+        elif is_shadow_arm(r):
             ovr = r.get("overrides") or []
             console.print(f"\n[bold]## arm {r.get('arm')}[/]"
                           + (f" [dim](+ {' '.join(ovr)})[/]" if ovr else " [dim](current config)[/]")
@@ -105,16 +106,16 @@ def render_rows(rows: list[dict], console: Console) -> None:
 
 
 def _code_total(rs: list[dict]) -> float | None:
-    totals = [r["total_cost_usd"] for r in rs if r.get("role") == "code_context"
+    totals = [r["total_cost_usd"] for r in rs if is_code_context(r)
               and isinstance(r.get("total_cost_usd"), (int, float))]
     return max(totals) if totals else None
 
 
 def _mode(rs: list[dict]) -> str:
     for r in rs:
-        if r.get("role") == "run_start":
+        if is_run_start(r):
             return r.get("mode", "ask")
-    return "code" if any(r.get("role") == "code_session" for r in rs) else "ask"
+    return "code" if any(is_code_session(r) for r in rs) else "ask"
 
 
 def _pct(sorted_vals: list[float], p: int) -> float:

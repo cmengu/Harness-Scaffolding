@@ -67,7 +67,7 @@ transient → the world was flaky; rerun when the provider recovers.
 permanent → the command is wrong; check the argv above against the CLI's --help.
 """)
     os.chmod(path, 0o600)
-    record({"role": "quarantined", "head": head, "kind": context.get("kind"), "path": str(path)})
+    record(quarantined(head, context.get("kind"), path))
     return path
 
 
@@ -92,8 +92,7 @@ def start_session(**extra) -> str:
     resumes=<sid> continues an older session · summary=<text> replaces one (/compact) ·
     title=<str> names a fork. None values are dropped so bare calls stay bare rows."""
     sid = uuid.uuid4().hex[:12]
-    record({"role": "session_start", "session_id": sid,
-            **{k: v for k, v in extra.items() if v is not None}})
+    record(session_start(sid, **extra))          # constructor drops None → bare calls stay bare
     return sid
 
 
@@ -195,8 +194,11 @@ def head_cost(head: str, usd=None, tokens=None) -> dict:
 
 
 # -- debate flow --
-def debate_round(round: int, proposer, adversary=None) -> dict:
-    return _row("debate", round=round, proposer=proposer, adversary=adversary)
+def debate_round(round: int, proposer, adversary=None, **extra) -> dict:
+    """A round's answers. **extra carries the optional scratch critiques
+    (proposer_critique / adversary_critique) — None values drop, keeping event rows and
+    critique-less rounds bare."""
+    return _row("debate", round=round, proposer=proposer, adversary=adversary, **extra)
 
 
 def debate_event(event: str, **fields) -> dict:
@@ -322,6 +324,11 @@ def is_head_retry(row) -> bool: return _is(row, "head_retry")
 def is_cost(row) -> bool: return _is(row, "head_cost")
 def is_code_session(row) -> bool: return _is(row, "code_session")
 def is_code_context(row) -> bool: return _is(row, "code_context")
+def is_code_assistant(row) -> bool: return _is(row, "code_assistant")
+def is_code_tool(row) -> bool: return _is(row, "code_tool")
+def is_judge(row) -> bool: return _is(row, "judge")
+def is_quarantined(row) -> bool: return _is(row, "quarantined")
+def is_shadow_arm(row) -> bool: return _is(row, "shadow_arm")
 
 
 def is_answer(row) -> bool:

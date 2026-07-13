@@ -23,8 +23,9 @@ from . import flight
 from .backends import (Cancelled, HeadSessions, _classify, adversary,
                        adversary_stream, kill_inflight, proposer, proposer_stream)
 from .config import Config
-from .ledger import (chain_rows, head_call, head_error, head_retry, quarantine,
-                     record)
+from .ledger import (briefing, chain_rows, debate_event, debate_round, head_call,
+                     head_error, head_retry, head_session, is_answer, is_note,
+                     is_user, judge as judge_row, judge_keymap, quarantine, record)
 
 
 @dataclass
@@ -106,10 +107,10 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     else:
         q_a = q_b = seeded
     a, b = both(q_a, q_b, round_no=0)                                   # round 0 (ANSWER mode)
-    record({"role": "debate", "round": 0, "proposer": a, "adversary": b})
+    record(debate_round(0, a, b))
     dead = [h for h, t in (("claude", a), ("codex", b)) if _is_dead(t)]
     if dead:                                # a dead round 0 ends the debate — critiquing a
-        record({"role": "debate", "event": "round0_failed", "dead": dead})   # corpse is noise
+        record(debate_event("round0_failed", dead=dead))                     # corpse is noise
         if len(dead) == 2:
             console.print("[red]✗ both heads failed — turn abandoned (nothing was answered)[/]")
         else:
@@ -134,21 +135,19 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         raw_a, raw_b = both(msg_a, msg_b, round_no=n)
         died = [h for h, t in (("claude", raw_a), ("codex", raw_b)) if _is_dead(t)]
         if died:                             # mid-debate death: keep the last GOOD answers
-            record({"role": "debate", "event": "round_failed", "round": n, "dead": died})
+            record(debate_event("round_failed", round=n, dead=died))
             console.print(f"[yellow]⚠ {' and '.join(died)} failed in round {n} — "
                           "keeping the previous round's answers[/]")
             a, b = prev_a, prev_b
             break
         crit_a, a = _split_verdict(raw_a)
         crit_b, b = _split_verdict(raw_b)
-        row = {"role": "debate", "round": n, "proposer": a, "adversary": b}
-        if crit_a:
-            row["proposer_critique"] = crit_a       # the deliverable stays clean; the scratch
-        if crit_b:
-            row["adversary_critique"] = crit_b      # work survives for replay/audit
-        record(row)
+        # the deliverable (proposer/adversary) stays clean; the scratch critiques survive
+        # for replay/audit — None drops, so a critique-less round stays bare.
+        record(debate_round(n, a, b, proposer_critique=crit_a or None,
+                            adversary_critique=crit_b or None))
         if _moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10:        # deterministic early-stop
-            record({"role": "debate", "event": "converged", "round": n})
+            record(debate_event("converged", round=n))
             break
     if not cfg.stream_tape:
         _present(console, a, b, cfg)                     # the tape already showed everything live
@@ -478,7 +477,7 @@ def _synthesize(question, r, *, style, cfg, console, live=True):
     'reasoning'=evidence verdict, may ESCALATE. Inputs BLIND-GRADED (labels stripped, A/B shuffled)."""
     pair = [("A", r.proposer_final, "claude"), ("B", r.adversary_final, "codex")]
     random.shuffle(pair)
-    record({"role": "judge_keymap", "map": {slot: fam for slot, _, fam in pair}})
+    record(judge_keymap({slot: fam for slot, _, fam in pair}))
     blind = "\n\n".join(f"Answer {slot}:\n{text}" for slot, text, _ in pair)
     judge_fn = proposer if (cfg.heads.judge or "claude") == "claude" else adversary
     instruction = ("Merge these into ONE synthesis — do NOT add a new position or pick a winner."
@@ -493,7 +492,7 @@ def _synthesize(question, r, *, style, cfg, console, live=True):
         else:
             console.print("[dim]⚖ judge weighing…[/]")
             verdict = _safe(judge_fn, judge_msg, cfg, "judge")
-    record({"role": "judge", "style": style, "text": verdict})   # the verdict must survive the
+    record(judge_row(style, verdict))                            # the verdict must survive the
     r.synthesis = verdict                                        # session — /last + replay read it
     r.escalated = (style == "reasoning" and verdict.strip().upper().startswith("ESCALATE"))
     console.print(f"\n[bold]## ⚖ Synthesis[/] ({style})\n{verdict}")
@@ -510,9 +509,9 @@ def _chain_turns() -> tuple[str | None, list[str]]:
     summary, rows = chain_rows()
     turns, pending = [], None
     for r in rows:
-        if r.get("role") == "user":
+        if is_user(r):
             pending = f"USER: {r['text']}"
-        elif r.get("role") == "debate" and r.get("round") is not None and "proposer" in r:
+        elif is_answer(r):
             if pending:
                 turns.append(pending)
                 pending = None
@@ -527,10 +526,8 @@ def _pending_notes() -> str:
     live head sessions (which skip the preamble) receive them too. Consumed by answering:
     once a debate row lands after them, they're history, not pending."""
     _, rows = chain_rows()
-    last_answer = max((i for i, r in enumerate(rows)
-                       if r.get("role") == "debate" and r.get("round") is not None
-                       and "proposer" in r), default=-1)
-    notes = [r["text"] for r in rows[last_answer + 1:] if r.get("role") == "note"]
+    last_answer = max((i for i, r in enumerate(rows) if is_answer(r)), default=-1)
+    notes = [r["text"] for r in rows[last_answer + 1:] if is_note(r)]
     if not notes:
         return ""
     facts = "\n".join(f"- {n}" for n in notes)
@@ -627,8 +624,8 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
                                   + "\n\n".join(turns) + "\n\n---\n\n")
         else:                                                # free text = the user's own briefing
             self.briefing_seed = f"Briefing from the user:\n{choice}\n\n"
-        record({"role": "briefing", "choice": low if low in ("", "a", "b", "c") else "custom",
-                "text": (self.briefing_seed or "")[:2000]})
+        record(briefing(low if low in ("", "a", "b", "c") else "custom",
+                        text=(self.briefing_seed or "")[:2000]))
 
     def _pick_briefing(self) -> str | None:
         """Seam for tests/headless: returns 'a'/'b'/'c'/'custom' via the arrow picker,
@@ -661,7 +658,7 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
                 else:
                     self.console.print(f"[dim]{g} claude thinking… (^C cancels)[/]")
                     out = _safe(solo, pre + user_input, self.cfg, "claude")
-            record({"role": "debate", "round": 0, "proposer": out, "adversary": None})
+            record(debate_round(0, out, None))
             self.console.print(f"[orange1]## {g} Claude[/]\n{out}")
             return
         if self.cfg.head_sessions and self.sessions is None:
@@ -681,4 +678,4 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
             judge=self.cfg.judge_style, cfg=self.cfg, console=self.console,
             sessions=s, seed=seed, live=self.live_status)
         if s is not None and (s.claude or s.codex) and (s.claude, s.codex) != pre_ids:
-            record({"role": "head_session", "claude": s.claude, "codex": s.codex})
+            record(head_session(claude=s.claude, codex=s.codex))
