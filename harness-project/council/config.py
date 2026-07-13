@@ -48,6 +48,11 @@ class Config:
     claude_tools: str = "Read Grep Glob WebSearch WebFetch"   # the allowlist when tools are on (no Bash in v1)
     # The tape (step 5): duels stream both heads interleaved into one scroll column.
     stream_tape: bool = True         # false = the classic block-then-present duel
+    tape_verbose: bool = True        # show the dim thinking/tool/retry lines (Ctrl+T / /tape flips live)
+    # Context meter (flight panel): window sizes the ⛁ % is computed against. Approximate
+    # on purpose — the CLIs don't report their window, so these are per-model knobs.
+    claude_context_window: int = 200_000
+    codex_context_window: int = 272_000
     claude_glyph: str = "✳"          # gutter mark per head (terminals can't render logos;
     codex_glyph: str = "⬡"           # ✳ = Anthropic starburst, ⬡ = nearest to the OpenAI knot)
     head_retries: int = 2            # attempts AFTER the first try — spent on TRANSIENT failures only

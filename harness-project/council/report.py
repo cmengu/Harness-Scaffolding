@@ -69,7 +69,9 @@ def render_rows(rows: list[dict], console: Console) -> None:
     """One ledger row → its terminal form. Shared by replay (a whole run) and ask-mode
     /history + /switch recap (the active chain). The `"proposer" in r` guard keeps event
     rows (converged/cancelled share role=debate) from rendering as empty Claude blocks."""
+    from .config import load_config
     from .debate import _present                     # lazy: avoids a module cycle at import
+    cfg = load_config()                              # glyphs only — no runtime knob reaches here
     for r in rows:
         role = r.get("role")
         if role in ("user", "code_user"):
@@ -78,9 +80,9 @@ def render_rows(rows: list[dict], console: Console) -> None:
             console.print("[yellow]✗ turn cancelled[/]")
         elif role == "debate" and r.get("round") is not None and "proposer" in r:
             if r.get("adversary"):
-                _present(console, str(r.get("proposer", "")), str(r["adversary"]))
+                _present(console, str(r.get("proposer", "")), str(r["adversary"]), cfg)
             else:
-                console.print(f"[orange1]## 🟠 Claude[/]\n{r.get('proposer', '')}")
+                console.print(f"[orange1]## {cfg.claude_glyph} Claude[/]\n{r.get('proposer', '')}")
         elif role == "judge":
             console.print(f"\n[bold]## ⚖ Synthesis[/] ({r.get('style')})\n{r.get('text', '')}")
         elif role == "code_assistant":

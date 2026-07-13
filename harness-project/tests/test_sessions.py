@@ -8,7 +8,7 @@ from rich.console import Console
 from council import debate
 from council.backends import HeadSessions, adversary, proposer
 from council.config import load_config
-from council.ledger import trace
+from council.ledger import record, start_session, trace
 
 from conftest import STUBS
 
@@ -100,3 +100,47 @@ def test_permanent_failure_clears_that_heads_session(monkeypatch):
     debate._safe(adversary, "q", load_config(), "codex", s)
     assert s.codex is None                                # next duel reseeds codex…
     assert s.claude == "keep-me"                          # …claude's memory survives
+
+
+def test_half_minted_pair_reseeds_only_the_dead_head(monkeypatch):
+    """12 Jul regression: claude died on turn 1 (_safe cleared its session) while codex
+    minted. Turn 2 must hand the seed to the unminted head ONLY — before the fix the
+    seed rode all-or-nothing on _fresh(), so the dead head resumed nothing AND got no
+    preamble: a permanent cold start ("I don't have the earlier analysis")."""
+    monkeypatch.setenv("COUNCIL_STREAM_TAPE", "false")
+    calls = []
+
+    def fake_both(msg_a, msg_b, cfg, console, sessions=None, depth=None,
+                  round_no=0, live=True):
+        calls.append((msg_a, msg_b))
+        return "A-ans", "B-ans"
+
+    monkeypatch.setattr(debate, "_both", fake_both)
+    s = HeadSessions(codex="stub-thread-1")               # post-failure: claude unminted
+    debate.run("the question", rounds=0, judge=None, cfg=load_config(),
+               console=quiet(), sessions=s, seed="SEEDMARK\n\n")
+    msg_a, msg_b = calls[0]
+    assert msg_a.startswith("SEEDMARK")                   # recovering claude gets the back-story…
+    assert msg_b == "the question"                        # …the live codex head never doubles it
+
+
+def test_renderer_rebriefs_head_cleared_by_failure(tmp_path, monkeypatch):
+    """Renderer-level twin of the above: after a turn where one head's session was
+    cleared, the next armed turn re-briefs that head with the ledger preamble and
+    it re-mints — instead of cold-starting with the bare new message."""
+    monkeypatch.setenv("COUNCIL_ROUNDS", "0")             # capture holds the LAST claude call
+    start_session()                                       # chain_rows scopes to the active session
+    cfg = load_config()
+    r = debate.DebateRenderer(cfg, quiet(), adversarial=True)
+    record({"role": "user", "text": "first question"})
+    r.handle("first question")                            # healthy turn: both heads mint
+    assert r.sessions.claude == "stub-claude-sid"
+    r.sessions.clear("claude")                            # what _safe does on permanent failure
+    record({"role": "user", "text": "redo it"})
+    capture = tmp_path / "stdin"
+    monkeypatch.setenv("COUNCIL_STUB_CAPTURE", str(capture))
+    r.handle("redo it")
+    text = capture.read_text()
+    assert "Conversation so far" in text                  # the preamble reached the recovering head
+    assert "first question" in text                       # …carrying the turn it missed
+    assert r.sessions.claude == "stub-claude-sid"         # and it re-minted

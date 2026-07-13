@@ -112,6 +112,50 @@ One constraint binds every phase, so it goes first:
      popup → auto-(B). No dedicated "challenge" key — arm + whatever you type covers it.
    - Stream-mode shell stubs (fake JSONL emitters) join tests/stubs; CI green.
 
+## Phase 1.5 — adoption pass: the output contract + the refactors that carry it (2–3 weekends; sequenced 12 Jul)
+
+Sources, all decided 12 Jul 2026: the architecture review (five candidates), the debate-techniques
+catalog (`docs/debate-techniques-2026-07-12.md`), the artifact/skills research
+(`docs/artifact-skills-2026-07-12.md`), and the **output contract v1 spec — `docs/output-contract.md`**
+(the single source of truth for contract content; this section owns only the *order*).
+
+0. **Commit the current tree.** The flight-panel batch (flight.py + modified modules) lands as its
+   own commit; tests green. Every step below starts from a clean baseline.
+1. **policy.py pytest port** (~1 hour, warm-up). Port its `__main__` self-test into `tests/`; the
+   code-mode gate gets CI protection before any refactor touches the repo.
+2. **C1 + C2 in one sitting — Ledger row vocabulary + Preamble module.** One constructor per row
+   kind, one classifier per reader question (the five duplicated answer-guards collapse to one);
+   cost rows normalize usd|tokens so codex spend becomes visible. Preamble/turns/notes move into one
+   module owning the single clip window; the dead-marker re-sniff unifies while the files are open.
+   Done when: a row-shape change edits one file; `/context` measures the real preamble; CI green.
+3. **The contract** (`docs/output-contract.md`, all of it): injection template (round-0 / round-N /
+   judge variants), trailer slice + local validation, one native-schema-flag retry then graceful
+   degrade, tape additions (CLAIMS in the dim register, DELIBERATION in the thinking register —
+   process, excluded from deliverable surfaces; confidence on the ANSWER rule, ⚠
+   for unparsed trailers), artifact save + auto-open under `~/.council/artifacts/<run_id>/`, the
+   community prompt-line pack woven into the template, opponent confidence shown in round-1
+   messages. Trailer rows land via step 2's constructors.
+   Done when: an armed duel round-trips valid trailers from both heads; a visual question ends in
+   an opened artifact; stub-head tests assert the injected contract verbatim.
+4. **Trailer mechanics trio** (small, reads validated trailers): round-0 agreement router (positions
+   agree → skip the critique round, `round0_agreed` row), cross-head agreement early-stop + honest
+   `unresolved` row at the rounds cap, capitulation flag (`syco_flag` row, surfaced in `/report`).
+   Done when: an easy duel costs 2 calls; a deadlock ends honestly; an evidence-free cave flags.
+5. **C3 — the tape/event seam** (the standing constraint made real): `run()` emits events, the tape
+   renderer subscribes, a quiet renderer serves tests, the briefing popup moves to the REPL side.
+   Absorbs shadow.py's duplicated layout; makes `chat.run_loop` testable without a TTY.
+   Done when: engine tests assert events, not printed substrings; the two fan-outs are one.
+
+**Parked, with named wake-up triggers** (deliberate decisions, not omissions):
+- **C4 Head seam** ← a third head becomes wanted (jury judge, or a gemini-adversary experiment).
+- **C5 SessionState** ← knob persistence across restarts becomes wanted.
+- **The judge bucket** — both-orders judging, faithfulness scoring, PoLL jury, quote verifier,
+  confidence recalibration ← judge usage shows demand, or Phase-4 gate work begins (a gate forces
+  the judge on). The verdict-trailer shape is already fixed in the contract spec.
+- **Disagreement-intensity experiment** ← runs AFTER step 3, on the contract's own DELIBERATION-clause
+  variants (agreeable / modest / forced × a fixed ~20-question set via `shadow.py`; default goes to
+  the best evidenced-stance ratio at acceptable cost). Tune, don't guess — but tune the real thing.
+
 ## Phase 2 — professional pass (2–3 weekends)
 
 - `council doctor`: binaries, auth state, tmux, versions, config lint (boot-probe code

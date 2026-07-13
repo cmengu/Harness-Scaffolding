@@ -7,6 +7,7 @@ import difflib
 import queue
 import random
 import subprocess
+import sys
 import threading
 import time
 from contextlib import nullcontext
@@ -18,6 +19,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+from . import flight
 from .backends import (Cancelled, HeadSessions, _classify, adversary,
                        adversary_stream, kill_inflight, proposer, proposer_stream)
 from .config import Config
@@ -84,8 +86,12 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     `judge`: falsy=off · 'moderator'=neutral merge · 'reasoning'=verdict, may escalate. (bool True → 'moderator'.)
     `sessions` = native head memory (11 Jul): rounds ≥1 send ONLY the other voice's answer —
     a resumed head already remembers the question and its own words. `seed` (history preamble /
-    briefing) rides in front of round 0 only; sessionless critiques keep repeating it, because
-    a stateless head forgets it between subprocesses."""
+    briefing) rides in front of round 0 only, PER HEAD: only a head about to mint gets it —
+    first turn, or one whose session _safe cleared after a failure (12 Jul: a half-minted
+    pair otherwise left the dead head permanently context-less — no resume AND no seed).
+    A live head already holds the back-story; reseeding would double its memory.
+    Sessionless critiques keep repeating the seed, because a stateless head forgets it
+    between subprocesses."""
     console = console or Console()
     if judge is True:
         judge = "moderator"
@@ -93,7 +99,12 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     both = partial(_stream_both if cfg.stream_tape else _both,
                    cfg=cfg, console=console, sessions=sessions, depth=depth, live=live)
     seeded = seed + question
-    a, b = both(seeded, seeded, round_no=0)                             # round 0 (ANSWER mode)
+    if sessions is not None:
+        q_a = (seed if sessions.claude is None else "") + question
+        q_b = (seed if sessions.codex is None else "") + question
+    else:
+        q_a = q_b = seeded
+    a, b = both(q_a, q_b, round_no=0)                                   # round 0 (ANSWER mode)
     record({"role": "debate", "round": 0, "proposer": a, "adversary": b})
     dead = [h for h, t in (("claude", a), ("codex", b)) if _is_dead(t)]
     if dead:                                # a dead round 0 ends the debate — critiquing a
@@ -101,7 +112,9 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         if len(dead) == 2:
             console.print("[red]✗ both heads failed — turn abandoned (nothing was answered)[/]")
         else:
-            console.print(f"[yellow]⚠ {dead[0]} failed — single-voiced answer, no debate[/]")
+            hint = (" (session cleared — it will be re-briefed next turn)"
+                    if sessions is not None and getattr(sessions, dead[0]) is None else "")
+            console.print(f"[yellow]⚠ {dead[0]} failed — single-voiced answer, no debate{hint}[/]")
         return DebateResult(proposer_final=a, adversary_final=b, escalated=len(dead) == 2)
     for n in range(1, rounds + 1):
         prev_a, prev_b = a, b
@@ -137,7 +150,7 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
             record({"role": "debate", "event": "converged", "round": n})
             break
     if not cfg.stream_tape:
-        _present(console, a, b)                          # the tape already showed everything live
+        _present(console, a, b, cfg)                     # the tape already showed everything live
     result = DebateResult(proposer_final=a, adversary_final=b)
     if judge:
         result = _synthesize(question, result, style=judge, cfg=cfg, console=console, live=live)
@@ -145,7 +158,7 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
 
 
 def _both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0, live=True):
-    """Both heads concurrently with a live 🟠/🔵 status (block-then-present; columns can't
+    """Both heads concurrently with a live per-head status (block-then-present; columns can't
     stream-interleave). The classic path (stream_tape=false); round_no is the tape's cue and
     is ignored here. ^C here lands in the MAIN thread (this spinner loop) while the heads
     run in workers — kill the subprocesses FIRST (their communicate() unblocks, each worker
@@ -156,22 +169,33 @@ def _both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0, liv
                  thinking=depth.get("thinking", 0), tools=depth.get("tools", False))
     pb = partial(adversary, session=sessions,
                  effort=depth.get("effort"), tools=depth.get("tools", False))
+    flight.begin("claude", "thinking")       # coarse: subprocesses give no events until done,
+    flight.begin("codex", "thinking")        # so idle == elapsed here (matches _run's wall clock)
     with ThreadPoolExecutor(max_workers=2) as pool:
         try:
             fa = pool.submit(_safe, pa, msg_a, cfg, "claude", sessions)
             fb = pool.submit(_safe, pb, msg_b, cfg, "codex", sessions)
             if live:
-                with Live(_status(fa, fb), console=console, refresh_per_second=8) as disp:
+                with Live(_status(fa, fb, cfg), console=console, refresh_per_second=8) as disp:
                     while not (fa.done() and fb.done()):
                         wait([fa, fb], timeout=0.15)
-                        disp.update(_status(fa, fb))
+                        _flight_futures(fa, fb)
+                        disp.update(_status(fa, fb, cfg))
             else:                            # composer owns the screen: no Live, just wait
                 while not (fa.done() and fb.done()):
                     wait([fa, fb], timeout=0.15)
+                    _flight_futures(fa, fb)
         except KeyboardInterrupt:
             kill_inflight()
             raise
         return fa.result(), fb.result()
+
+
+def _flight_futures(fa, fb) -> None:
+    if fa.done():
+        flight.done("claude")
+    if fb.done():
+        flight.done("codex")
 
 
 def _safe(fn, msg, cfg, label, sessions=None):
@@ -260,6 +284,8 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
     phase = {"claude": "working", "codex": "working"}
     spent = {"claude": "", "codex": ""}
     done: set[str] = set()
+    flight.begin("claude")                   # the flight panel mirrors phase/spent below —
+    flight.begin("codex")                    # same facts, rendered by the composer status line
     for t in threads:
         t.start()
     def status():
@@ -274,6 +300,27 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
     # as they land, but no Rich Live status line (Live + patch_stdout fight over the tty).
     disp = Live(status(), console=console, refresh_per_second=8, transient=True) if live else None
     update = (lambda: disp.update(status())) if disp else (lambda: None)
+    # Run-grouped boxes (QoL, 11 Jul): consecutive scratch events from ONE head stream
+    # inside a colored border, closed the moment the OTHER head interrupts (or its answer
+    # lands). Scrollback can't be edited after the fact, so the box is drawn LIVE —
+    # header when a run opens, │-edged lines while it lasts, footer when it ends.
+    open_run: list[str | None] = [None]
+
+    def close_box() -> None:
+        if open_run[0] is None:
+            return
+        c, _ = _HEAD_STYLE.get(open_run[0], ("white", open_run[0]))
+        console.print(f"[dim {c}]╰─[/]")
+        open_run[0] = None
+
+    def box_line(head: str, text: str) -> None:
+        c, name_ = _HEAD_STYLE.get(head, ("white", head))
+        if open_run[0] != head:
+            close_box()
+            console.print(f"[dim {c}]╭─[/] [{c}]{_glyph(cfg, head)} {name_}[/]")
+            open_run[0] = head
+        for ln in text.splitlines() or [""]:
+            console.print(f"[dim {c}]│[/] [dim]{ln}[/dim]")
     try:
         with disp or nullcontext():
             while len(done) < 2:
@@ -285,33 +332,48 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
                 head, kind, payload = ev["head"], ev["kind"], ev["payload"]
                 color, name = _HEAD_STYLE.get(head, ("white", head))
                 g = _glyph(cfg, head)
+                flight.beat(head)                               # every event = proof of life
                 if kind == "_done":
                     done.add(head)
+                    flight.done(head)
+                    if open_run[0] == head:  # a head that dies mid-run leaves no open box
+                        close_box()
                 elif kind == "text":
                     phase[head] = "writing"                     # prose buffers; commits on final
+                    flight.phase(head, "writing")
                 elif kind == "thinking":
                     phase[head] = "thinking"
-                    if isinstance(payload, dict) and payload.get("text"):
-                        console.print(f"[dim][{color}]{g}[/] {payload['text'].strip()}[/dim]")
+                    flight.phase(head, "thinking")
+                    # cfg.tape_verbose re-read PER EVENT: Ctrl+T / /tape flips it mid-turn
+                    # and the pump honors it immediately (hides the text, never the phase).
+                    if not cfg.tape_verbose:
+                        pass
+                    elif isinstance(payload, dict) and payload.get("text"):
+                        box_line(head, payload["text"].strip())
                     elif isinstance(payload, dict) and payload.get("tokens"):
-                        console.print(f"[dim][{color}]{g}[/] thought for "
-                                      f"{payload['tokens']} tokens (trace hidden headless)[/dim]")
+                        box_line(head, f"thought for {payload['tokens']} tokens "
+                                       "(trace hidden headless)")
                 elif kind == "tool":
                     phase[head] = "researching"
-                    console.print(f"[dim][{color}]{g}[/] 🔍 {payload.get('name', '?')}"
-                                  f"({str(payload.get('input', ''))[:80]})[/dim]")
+                    flight.phase(head, "researching")
+                    if cfg.tape_verbose:
+                        box_line(head, f"🔍 {payload.get('name', '?')}"
+                                       f"({str(payload.get('input', ''))[:80]})")
                 elif kind == "retry":
-                    console.print(f"[dim][{color}]{g}[/] ↻ retrying "
-                                  f"(attempt {payload.get('attempt')}) — {payload.get('error', '')}[/dim]")
+                    if cfg.tape_verbose:
+                        box_line(head, f"↻ retrying (attempt {payload.get('attempt')})"
+                                       f" — {payload.get('error', '')}")
                 elif kind == "cost":
                     if isinstance(payload, dict) and payload.get("usd") is not None:
-                        spent[head] = f" ${payload['usd']:.2f}"
+                        spent[head] = f" ~${payload['usd']:.2f}"
+                        flight.cost(head, float(payload["usd"]))
                 elif kind == "final":
                     finals[head] = str(payload)          # raw back to run(), which re-splits
                     crit, ans = _split_verdict(finals[head]) if round_no else ("", finals[head])
                     if crit:                             # scratch work: dim, honestly labelled
-                        console.print(f"[dim][{color}]{g}[/] {name} challenges:[/dim]")
-                        console.print(f"[dim]{crit}[/dim]")
+                        box_line(head, f"{name} challenges:")
+                        box_line(head, crit)
+                    close_box()                          # answers stand OUTSIDE the scratch box
                     console.rule(f"[{color}]{g} {name}[/]"
                                  + (f"  [dim]round {round_no}[/]" if round_no else ""),
                                  style=color, align="left")
@@ -322,13 +384,16 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
                     else:
                         err = (payload or {}).get("error", "?")
                         finals[head] = f"_({head} unavailable: {err})_"
+                        close_box()
                         console.print(f"[red]{g} {head} unavailable — {str(err)[:120]}[/red]")
                 update()
     except KeyboardInterrupt:
         kill_inflight()                     # workers unblock, _safe_stream yields error, _done lands
+        close_box()
         for t in threads:
             t.join(timeout=5)
         raise
+    close_box()
     for t in threads:
         t.join()
     return (finals.get("claude") or "_(claude unavailable: empty stream)_",
@@ -384,26 +449,28 @@ def _moved(prev, now):  # 0=identical, 1=rewritten. Crude on purpose; never fire
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # wall-clock indexed so redraws from other sources don't jitter it
 
 
-def _status(fa, fb):
+def _status(fa, fb, cfg):
     spin = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
     mark = lambda f: "✓" if f.done() else f"{spin} thinking"
-    return f"🟠 claude {mark(fa)}    🔵 codex {mark(fb)}    [dim]^C cancels[/]"
+    return (f"[orange1]{cfg.claude_glyph}[/] claude {mark(fa)}    "
+            f"[blue]{cfg.codex_glyph}[/] codex {mark(fb)}    [dim]^C cancels[/]")
 
 
-def _present(console, a, b):
+def _present(console, a, b, cfg):
     """Duel output, width-adaptive: side-by-side only when each voice gets readable prose
     width (≥~52 chars/column at 110 cols); narrower terminals get full-width blocks under
     rule headers — content owns the terminal, not the layout."""
+    ga, gb = cfg.claude_glyph, cfg.codex_glyph
     if console.width >= 110:
         cols = Table.grid(padding=(0, 2))
         cols.add_column()
         cols.add_column()
-        cols.add_row(f"[orange1]## 🟠 Claude[/]\n{a}", f"[blue]## 🔵 Codex[/]\n{b}")
+        cols.add_row(f"[orange1]## {ga} Claude[/]\n{a}", f"[blue]## {gb} Codex[/]\n{b}")
         console.print(cols)
     else:
-        console.rule("[orange1]🟠 Claude[/]", style="orange1", align="left")
+        console.rule(f"[orange1]{ga} Claude[/]", style="orange1", align="left")
         console.print(a)
-        console.rule("[blue]🔵 Codex[/]", style="blue", align="left")
+        console.rule(f"[blue]{gb} Codex[/]", style="blue", align="left")
         console.print(b)
 
 
@@ -420,12 +487,13 @@ def _synthesize(question, r, *, style, cfg, console, live=True):
                    "Weigh the evidence. Give '## Where they agree', '## Where they differ', then a verdict. "
                    "If neither is adequately supported, reply starting with the word ESCALATE and say why.")
     judge_msg = f"Question:\n{question}\n\n{blind}\n\n{instruction}"
-    if live:
-        with console.status("[dim]⚖ judge weighing…[/]", spinner="dots"):   # 20s+ silent otherwise
+    with flight.track("judge", "weighing"):
+        if live:
+            with console.status("[dim]⚖ judge weighing…[/]", spinner="dots"):   # 20s+ silent otherwise
+                verdict = _safe(judge_fn, judge_msg, cfg, "judge")
+        else:
+            console.print("[dim]⚖ judge weighing…[/]")
             verdict = _safe(judge_fn, judge_msg, cfg, "judge")
-    else:
-        console.print("[dim]⚖ judge weighing…[/]")
-        verdict = _safe(judge_fn, judge_msg, cfg, "judge")
     record({"role": "judge", "style": style, "text": verdict})   # the verdict must survive the
     r.synthesis = verdict                                        # session — /last + replay read it
     r.escalated = (style == "reasoning" and verdict.strip().upper().startswith("ESCALATE"))
@@ -487,7 +555,7 @@ def _history_preamble(cfg: Config) -> str:
 
 class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
     """The /duel two-way branch. adversarial=False (DEFAULT) → plain claude chat, one subprocess,
-    cheap turns. adversarial=True → the full 🟠vs🔵 debate. run_loop's /duel flips the flag live;
+    cheap turns. adversarial=True → the full ✳-vs-⬡ debate. run_loop's /duel flips the flag live;
     it takes effect next turn (handle blocks, so a turn in flight always finishes first).
     Style from cfg.judge_style (whether/how); family from cfg.heads.judge (who).
     Owns the duel's HeadSessions: minted on the FIRST armed message (seeded once from the
@@ -537,11 +605,18 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
         self.console.rule(f"[dim]briefing {self.cfg.codex_glyph} codex will receive[/]",
                           style="dim", align="left")
         self.console.print(f"[dim]{draft}[/dim]")
-        self.console.print("[bold]A[/] send this briefing (recommended) · [bold]B[/] send the "
-                           f"last {self.cfg.history_turns} turns · [bold]C[/] send the full "
-                           "transcript · or type your own")
-        choice = self.console.input("[bold]briefing ›[/] ").strip()
-        low = choice.lower()
+        picked = self._pick_briefing()               # arrow-key picker on a TTY (11 Jul ask)
+        if picked == "custom":
+            choice = self.console.input("[bold]your briefing ›[/] ").strip()   # "" falls
+            low = choice.lower()                     # through to A below, same as classic
+        elif picked is not None:
+            choice = low = picked
+        else:                                        # no TTY / no pt: the classic typed path
+            self.console.print("[bold]A[/] send this briefing (recommended) · [bold]B[/] send "
+                               f"the last {self.cfg.history_turns} turns · [bold]C[/] send the "
+                               "full transcript · or type your own")
+            choice = self.console.input("[bold]briefing ›[/] ").strip()
+            low = choice.lower()
         if low in ("", "a"):
             self.briefing_seed = ("Briefing on the conversation so far (written by the other "
                                   f"voice, confirmed by the user):\n{draft}\n\n")
@@ -556,30 +631,55 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
         record({"role": "briefing", "choice": low if low in ("", "a", "b", "c") else "custom",
                 "text": (self.briefing_seed or "")[:2000]})
 
+    def _pick_briefing(self) -> str | None:
+        """Seam for tests/headless: returns 'a'/'b'/'c'/'custom' via the arrow picker,
+        or None when there's no TTY/pt — the caller falls back to typed input."""
+        if not sys.stdin.isatty():
+            return None
+        try:
+            from .composer import show_picker
+        except ImportError:
+            return None
+        options = [("A", "send this briefing (recommended)"),
+                   ("B", f"send the last {self.cfg.history_turns} turns"),
+                   ("C", "send the full transcript"),
+                   ("D", "type your own briefing")]
+        got = show_picker(options, accent=self.cfg.accent_color, title="briefing ›")
+        return {0: "a", 1: "b", 2: "c", 3: "custom", None: "a"}[got]   # Esc/^C = default A
+
     def handle(self, user_input: str) -> None:
         user_input = _pending_notes() + user_input          # /note facts ride EVERY next message
         if not self.adversarial:                            # SOLO: claude only, with memory
             pre = _history_preamble(self.cfg)
             solo = partial(proposer, thinking=self.cfg.solo_thinking_tokens,
                            tools=self.cfg.solo_tools)       # fast by default; owner may arm
-            if self.live_status:
-                with self.console.status("[dim]🟠 claude thinking… (^C cancels)[/]", spinner="dots"):
+            g = self.cfg.claude_glyph
+            with flight.track("claude"):
+                if self.live_status:
+                    with self.console.status(f"[dim]{g} claude thinking… (^C cancels)[/]",
+                                             spinner="dots"):
+                        out = _safe(solo, pre + user_input, self.cfg, "claude")
+                else:
+                    self.console.print(f"[dim]{g} claude thinking… (^C cancels)[/]")
                     out = _safe(solo, pre + user_input, self.cfg, "claude")
-            else:
-                self.console.print("[dim]🟠 claude thinking… (^C cancels)[/]")
-                out = _safe(solo, pre + user_input, self.cfg, "claude")
             record({"role": "debate", "round": 0, "proposer": out, "adversary": None})
-            self.console.print(f"[orange1]## 🟠 Claude[/]\n{out}")
+            self.console.print(f"[orange1]## {g} Claude[/]\n{out}")
             return
         if self.cfg.head_sessions and self.sessions is None:
             self.sessions = HeadSessions()
         s = self.sessions
         fresh = self._fresh()
+        # Reseed whenever ANY head is about to mint — not only when both are (12 Jul):
+        # a failed head gets its session cleared by _safe, and without this it resumed
+        # nothing AND got no preamble — a permanent cold start. run() applies the seed
+        # per head, so the live head never receives it twice.
+        reseed = s is None or s.claude is None or s.codex is None
         seed = (self.briefing_seed if fresh and self.briefing_seed is not None
-                else _history_preamble(self.cfg)) if fresh else ""
+                else _history_preamble(self.cfg)) if reseed else ""
         self.briefing_seed = None                           # one briefing seeds one session
+        pre_ids = (s.claude, s.codex) if s is not None else None
         run(user_input, rounds=self.cfg.rounds,             # DUEL: the full debate engine
             judge=self.cfg.judge_style, cfg=self.cfg, console=self.console,
             sessions=s, seed=seed, live=self.live_status)
-        if fresh and s is not None and (s.claude or s.codex):
+        if s is not None and (s.claude or s.codex) and (s.claude, s.codex) != pre_ids:
             record({"role": "head_session", "claude": s.claude, "codex": s.codex})

@@ -52,12 +52,17 @@ class Composer:
     def __init__(self, console: Console, *, accent: str, title: str,
                  marker: Callable[[], str], status: Callable[[], str],
                  commands: list[tuple[str, str, str]], history_path,
-                 on_toggle: Callable[[], None] | None = None) -> None:
+                 on_toggle: Callable[[], None] | None = None,
+                 on_cancel: Callable[[], None] | None = None,
+                 hotkeys: dict[str, Callable[[], None]] | None = None,
+                 arg_words: Callable[[str, int, list[str]], tuple[str, ...]] | None = None) -> None:
         self.console = console
         self._accent = accent
         self._marker = marker
-        self._status = status
+        self._status = status                # str OR prompt_toolkit fragments — see _status_fragments
         self._on_toggle = on_toggle          # Shift+Tab: arm/disarm the duel (step 8)
+        self._on_cancel = on_cancel          # bare Esc on an EMPTY box (the turn-cancel path)
+        self._hotkeys = hotkeys or {}        # extra one-shot keys → callbacks (e.g. c-t)
         self._pending_draft = ""             # survives a Ctrl+O overlay trip (see _bindings)
         _install_shift_enter()
         history_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -68,7 +73,7 @@ class Composer:
             erase_when_done=True,            # composer vanishes on submit; read() re-echoes
             refresh_interval=0.5,            # status line ticks while a parked turn runs (step 7)
             history=FileHistory(str(history_path)),
-            completer=_SlashCompleter(commands),
+            completer=_SlashCompleter(commands, arg_words),
             key_bindings=self._bindings(),
             reserve_space_for_menu=0,        # menu space comes from _input_height instead
             prompt_continuation=lambda width, line_no, soft: [("class:prompt", "… ")] if not soft else "",
@@ -78,6 +83,11 @@ class Composer:
                 "bottom-toolbar": f"noreverse {accent}",
             }),
         )
+        # Bare Esc must feel instant, not "swallowed": pt holds a lone ESC byte for
+        # ttimeoutlen before deciding it isn't the start of a chord (Esc+Enter, Alt+…).
+        # 0.25s keeps the chords working and halves the stock 0.5s hesitation.
+        self._session.app.ttimeoutlen = 0.25
+        self._install_crash_logger(history_path.parent / "crashes.log")
         self._patch_layout()
         set_title(title)
 
@@ -114,6 +124,10 @@ class Composer:
                 buf.cursor_position = len(buf.text)
                 buf.insert_text("\n")
             else:
+                clean = _scrub_surrogates(buf.text)      # BEFORE accept: the history file
+                if clean is not buf.text:                # encodes strict (crash 11 Jul)
+                    buf.text = clean
+                    buf.cursor_position = len(clean)
                 buf.validate_and_handle()
 
         @kb.add("escape", "enter")           # works everywhere (Esc then Enter)
@@ -147,7 +161,61 @@ class Composer:
                 run_in_terminal(self._on_toggle)
                 event.app.invalidate()
 
+        # Bare Esc, layered (backlog item 7): close the slash menu → clear the draft →
+        # (empty box) the turn-cancel path, whose arm/confirm brain lives in the on_cancel
+        # callback so this widget stays council-free. NOT eager: Esc+Enter and the default
+        # Alt/meta chords must still win — pt disambiguates via ttimeoutlen (set in __init__).
+        @kb.add("escape", filter=~is_searching)
+        def _esc(event) -> None:
+            buf = event.current_buffer
+            if buf.complete_state:
+                buf.cancel_completion()
+            elif buf.text:
+                buf.text = ""
+                buf.cursor_position = 0
+            elif self._on_cancel is not None:
+                from prompt_toolkit.application import run_in_terminal
+                run_in_terminal(self._on_cancel)
+                event.app.invalidate()
+
+        for key, fn in self._hotkeys.items():           # e.g. c-t: the tape toggle
+            @kb.add(key, eager=True)
+            def _hot(event, fn=fn) -> None:
+                from prompt_toolkit.application import run_in_terminal
+                run_in_terminal(fn)
+                event.app.invalidate()
+
         return kb
+
+    def _install_crash_logger(self, path) -> None:
+        """pt's stock answer to an exception on the app's event loop is a MODAL
+        'Press ENTER to continue...' prompt — which itself crashes when more input is
+        queued behind it (live-observed 11 Jul: spam Shift+Tab + huge paste → double
+        'Application is not running' cascade). Council's contract: the composer never
+        holds the session hostage. Replace the handler — full traceback to a file, one
+        dim line to the screen, render loop recovers. Instance-attribute shadowing is
+        the seam: run_async re-reads self._handle_exception each run (verified 3.0.52)."""
+        import time
+        import traceback
+
+        def _log(loop, context) -> None:
+            exc = context.get("exception")
+            try:
+                with open(path, "a") as f:
+                    f.write(f"\n── {time.ctime()} · composer event-loop exception ──\n")
+                    if exc is not None:
+                        f.write("".join(traceback.format_exception(type(exc), exc,
+                                                                   exc.__traceback__)))
+                    else:
+                        f.write(str(context.get("message", context)) + "\n")
+            except OSError:
+                pass                         # logging must never become the second crash
+            try:                             # patch_stdout routes this above the prompt
+                print(f"⚠ composer hiccup — details in {path}; recovered, keep typing")
+            except Exception:
+                pass
+
+        self._session.app._handle_exception = _log
 
     def _patch_layout(self) -> None:
         """The omnigent layout surgery. Verified against prompt_toolkit 3.0.52: the root
@@ -167,9 +235,17 @@ class Composer:
             FormattedTextControl(lambda: FormattedText([("class:bar", "─" * _term_width())])),
             height=1, dont_extend_height=True))          # composer zone off from content
         children.append(Window(              # — status line under it
-            FormattedTextControl(lambda: FormattedText([("class:bottom-toolbar", self._status())])),
+            FormattedTextControl(self._status_fragments),
             height=1, dont_extend_height=True))
         root.children = children
+
+    def _status_fragments(self) -> FormattedText:
+        """The status callable may return a plain str (one toolbar-styled run, the classic
+        shape) or a fragments list [(style, text), …] — the flight panel colors its ⚠s."""
+        s = self._status()
+        if isinstance(s, str):
+            return FormattedText([("class:bottom-toolbar", s)])
+        return FormattedText(s)
 
     def _input_height(self) -> Dimension:
         rows = _visual_lines(self._session.default_buffer.text,
@@ -229,18 +305,77 @@ def show_overlay(title: str, body_ansi: str, *, accent: str = "cyan") -> None:
     ).run()
 
 
-class _SlashCompleter(Completer):
-    """Popup only while typing the command word itself — never over arguments."""
+def show_picker(options: list[tuple[str, str]], *, accent: str = "cyan",
+                title: str = "") -> int | None:
+    """Inline arrow-key picker, for BETWEEN prompts (main thread, plain sync context —
+    show_overlay's contract minus the alternate screen): a few lines render in place,
+    ↑/↓ move, Enter picks, an option's letter jump-picks, Esc/^C cancels (None).
+    erase_when_done leaves the scrollback clean. `options` = [(accelerator, label), …]."""
+    idx = [0]
 
-    def __init__(self, commands: list[tuple[str, str, str]]) -> None:
+    def move(event, delta: int) -> None:
+        idx[0] = (idx[0] + delta) % len(options)
+        event.app.invalidate()
+
+    kb = KeyBindings()
+    kb.add("up")(lambda e: move(e, -1))
+    kb.add("down")(lambda e: move(e, +1))
+    kb.add("enter")(lambda e: e.app.exit(result=idx[0]))
+    for key in ("escape", "c-c"):
+        kb.add(key)(lambda e: e.app.exit(result=None))
+    for i, (accel, _label) in enumerate(options):
+        if len(accel) == 1 and accel.lower() != accel.upper():   # letters only — glyph
+            kb.add(accel.lower())(lambda e, i=i: e.app.exit(result=i))   # accelerators
+            kb.add(accel.upper())(lambda e, i=i: e.app.exit(result=i))   # stay display-only
+
+    def frags() -> FormattedText:
+        out = []
+        if title:
+            out.append(("class:dim", f"{title}\n"))
+        for i, (accel, label) in enumerate(options):
+            cur = i == idx[0]
+            out.append(("class:sel" if cur else "", f"{'❯' if cur else ' '} {accel}  {label}\n"))
+        out.append(("class:dim", "  ↑↓ move · Enter picks · Esc = first option"))
+        return FormattedText(out)
+
+    app = Application(
+        layout=Layout(Window(FormattedTextControl(frags, show_cursor=False), wrap_lines=True)),
+        key_bindings=kb,
+        erase_when_done=True,
+        mouse_support=False,
+        style=Style.from_dict({"sel": f"bold {accent}", "dim": "ansibrightblack"}),
+    )
+    app.ttimeoutlen = 0.25                   # bare Esc decides fast (no chords registered)
+    return app.run()
+
+
+class _SlashCompleter(Completer):
+    """Popup while typing the command word — and, when the host supplies `arg_words`,
+    over FINITE-vocabulary arguments too (/model claude opus, /effort high). Free-text
+    arguments (/note, /fork titles) stay popup-free: an empty vocabulary yields nothing."""
+
+    def __init__(self, commands: list[tuple[str, str, str]],
+                 arg_words=None) -> None:
         self._commands = commands
+        self._arg_words = arg_words
 
     def get_completions(self, doc, _event):
         t = doc.text_before_cursor
-        if t.startswith("/") and " " not in t and "\n" not in t:
+        if not t.startswith("/") or "\n" in t:
+            return
+        if " " not in t:
             for cmd, _args, desc in self._commands:
                 if cmd.startswith(t):
                     yield Completion(cmd, start_position=-len(t), display_meta=desc)
+            return
+        if self._arg_words is None:
+            return
+        words = t.split()
+        partial = "" if t.endswith(" ") else words[-1]
+        prior = words[1:-1] if partial else words[1:]
+        for word in self._arg_words(words[0], len(prior), prior):
+            if word.startswith(partial):
+                yield Completion(word, start_position=-len(partial))
 
 
 def _find_buffer_window(container) -> Window | None:
@@ -274,6 +409,20 @@ def _term_width() -> int:
         return os.get_terminal_size().columns
     except (ValueError, OSError):
         return 80
+
+
+def _scrub_surrogates(text: str) -> str:
+    """A huge paste split mid-character across pt's input reads (or its detach/attach
+    cycles — spam Shift+Tab widens the odds) decodes into lone \\udcXX surrogates. They
+    are the ORIGINAL BYTES in disguise (surrogateescape), so re-encoding them usually
+    reassembles the real character (— … ⚔); anything genuinely invalid becomes �.
+    Without this, every strict utf-8 encoder downstream throws — the history file blew
+    up the event loop and the head's stdin killed the call (live crash 11 Jul)."""
+    try:
+        text.encode("utf-8")                 # fast path: clean text costs one scan
+        return text
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
 
 _SHIFT_ENTER_INSTALLED = False

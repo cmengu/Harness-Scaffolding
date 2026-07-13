@@ -68,7 +68,7 @@ class Renderer:
             return                              # attach skips delta history at the offset
         if delta.message_id != self._streaming_id:
             self._streaming_id = delta.message_id
-            sys.stdout.write("\n\033[38;5;208m🟠 \033[0m")      # new assistant message
+            sys.stdout.write(f"\n\033[38;5;208m{self.cfg.claude_glyph} \033[0m")   # new assistant message
         sys.stdout.write(delta.delta)
         sys.stdout.flush()
         if delta.final:
@@ -89,7 +89,7 @@ class Renderer:
                 # No delta stream covered this message (MessageDisplay hook missing/off) —
                 # the transcript is authoritative, so paint it now rather than drop it.
                 self._streamed_finals = self._transcript_finals
-                self.console.print(f"\n[orange1]🟠[/] {item['text']}")
+                self.console.print(f"\n[orange1]{self.cfg.claude_glyph}[/] {item['text']}")
         elif kind == "user_text":
             record({"role": "code_user", "text": item["text"]})
         elif kind == "tool_use":
@@ -104,7 +104,7 @@ class Renderer:
         kind = item["kind"]
         if kind == "assistant_text":
             self._transcript_finals += 1
-            self.console.print(f"\n[dim]🟠 {item['text']}[/]")
+            self.console.print(f"\n[dim]{self.cfg.claude_glyph} {item['text']}[/]")
         elif kind == "user_text":
             self.console.print(f"\n[dim]› {item['text']}[/]")
         elif kind == "tool_use":

@@ -83,3 +83,43 @@ def test_think_and_tools_slash_commands():
     assert cfg.solo_tools is True
     chat._slash("/think nonsense max", r, quiet())  # bad mode → usage, no crash, no change
     assert cfg.duel_thinking_tokens == 31999
+
+
+def test_model_aliases_and_head_guessing():
+    """12 Jul: /model claude opus expands the alias; /model opus infers the head;
+    unknown names still ship verbatim (warn-never-block survives the sugar)."""
+    cfg = load_config()
+    r = debate.DebateRenderer(cfg, quiet(), adversarial=False)
+    chat._slash("/model claude opus", r, quiet())
+    assert cfg.claude_model == "claude-opus-4-8"
+    chat._slash("/model fable", r, quiet())               # bare alias → claude
+    assert cfg.claude_model == "claude-fable-5"
+    chat._slash("/model gpt-5.5", r, quiet())             # gpt-* → codex
+    assert cfg.codex_model == "gpt-5.5"
+    chat._slash("/model claude made-up-name", r, quiet())  # verbatim passthrough
+    assert cfg.claude_model == "made-up-name"
+    chat._slash("/model claude reset", r, quiet())        # per-head reset
+    assert cfg.claude_model is None and cfg.codex_model == "gpt-5.5"
+    chat._slash("/model reset", r, quiet())
+    assert cfg.codex_model is None
+
+
+def test_think_named_levels_and_effort_xhigh():
+    cfg = load_config()
+    r = debate.DebateRenderer(cfg, quiet(), adversarial=False)
+    chat._slash("/think duel high", r, quiet())
+    assert cfg.duel_thinking_tokens == 16000
+    chat._slash("/think solo low", r, quiet())
+    assert cfg.solo_thinking_tokens == 4000
+    chat._slash("/effort xhigh", r, quiet())
+    assert cfg.codex_effort == "xhigh"
+
+
+def test_slash_arg_words_vocab():
+    """The popup vocabulary: finite knobs complete, free-text stays silent."""
+    assert "claude" in chat._slash_arg_words("/model", 0, [])
+    assert "opus" in chat._slash_arg_words("/model", 1, ["claude"])
+    assert "gpt-5.5" in chat._slash_arg_words("/model", 1, ["codex"])
+    assert "xhigh" in chat._slash_arg_words("/effort", 0, [])
+    assert "high" in chat._slash_arg_words("/think", 1, ["duel"])
+    assert chat._slash_arg_words("/note", 0, []) == ()    # free text — no popup

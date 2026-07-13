@@ -4,13 +4,17 @@ Input strip ↔ omnigent-ui-sdk terminal/_host.py (TerminalHost) — the SAME pr
 (prompt_toolkit PromptSession: history + completer + toolbar), minus its layout surgery."""
 from __future__ import annotations
 
+import json
+import re
 import sys
 import time
+from pathlib import Path
 from typing import Callable, Protocol
 
 from rich.console import Console
 from rich.table import Table
 
+from . import flight
 from .config import Config
 from .ledger import RUN_ID, chain_rows, record, sessions, start_session, trace
 
@@ -20,10 +24,11 @@ _COMMANDS: list[tuple[str, str, str]] = [
     ("/note", "<fact>", "hand the heads a fact — no models fire, rides into the next turn"),
     ("/rounds", "N", "debate depth when duelling"),
     ("/judge", "<style>", "off · moderator · reasoning"),
-    ("/model", "[head name]", "per-head model override — /model claude opus · /model reset"),
-    ("/effort", "[level]", "codex reasoning effort: minimal·low·medium·high · reset"),
-    ("/think", "<duel|solo> <n|max|off>", "claude thinking budget per mode (codex: /effort)"),
+    ("/model", "[head name]", "per-head model — /model claude opus · /model codex gpt-5.5 · reset"),
+    ("/effort", "[level]", "codex reasoning effort: minimal·low·medium·high·xhigh · reset"),
+    ("/think", "<duel|solo> <level|n>", "claude thinking: low·medium·high·max·off or a token count"),
     ("/tools", "<duel|solo> <on|off>", "may the heads research? (read-only files + web)"),
+    ("/tape", "", "show/hide the dim thinking/tool lines while heads stream (or Ctrl+T)"),
     ("/status", "", "adversary · rounds · judge · heads · session cost"),
     ("/cost", "", "what this session has spent so far"),
     ("/last", "", "reprint the previous answer / debate"),
@@ -46,7 +51,7 @@ class Renderer(Protocol):
     def handle(self, user_input: str) -> None: ...
 
 
-_SAFE_MID_TURN = {"/note", "/status", "/cost", "/help"}   # can't corrupt a turn in flight
+_SAFE_MID_TURN = {"/note", "/status", "/cost", "/tape", "/help"}   # can't corrupt a turn in flight
 
 
 def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
@@ -69,7 +74,27 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
     def turn_alive() -> bool:
         return turn[0] is not None and turn[0].is_alive()
 
-    read_input = _make_prompt(renderer, cfg, console, busy=turn_alive)
+    esc_armed = [0.0]                        # monotonic deadline while the Esc confirm is armed
+
+    def cancel_via_esc() -> None:
+        """Bare Esc on an empty box (backlog item 7). Esc is a twitch key and a duel is
+        minutes of paid work, so the first press only ARMS: the status bar shows '⚠ Esc
+        again' for 2s and the second press kills the heads. Unlike ^C, the queue is KEPT —
+        the worker rolls straight into the next question (^C stays the cancel-everything)."""
+        if not turn_alive():
+            esc_armed[0] = 0.0
+            return
+        if time.monotonic() < esc_armed[0]:
+            esc_armed[0] = 0.0
+            from .backends import kill_inflight
+            kill_inflight()
+            console.print("[yellow]✗ turn cancelled — queued questions kept (^C clears them too)[/]")
+        else:
+            esc_armed[0] = time.monotonic() + 2.0
+
+    read_input = _make_prompt(renderer, cfg, console, busy=turn_alive,
+                              queued=lambda: len(pending), esc_armed=esc_armed,
+                              on_cancel=cancel_via_esc)
     interactive = sys.stdin.isatty()
     if interactive:
         renderer.live_status = False         # composer owns the bottom; no Rich Live spinners
@@ -86,6 +111,8 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
             console.print("\n[yellow]✗ cancelled — answer discarded, question kept out of memory[/]")
         else:
             _turn_line(console, calls_before, spent_before, cfg)
+        finally:
+            flight.turn_over()               # the panel describes ONE turn; stale chips lie
 
     def worker(text: str) -> None:           # the parked turn: run, then drain the queue
         while True:
@@ -113,8 +140,8 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
                     break
                 if text.startswith("/"):
                     if turn_alive() and text.split()[0] not in _SAFE_MID_TURN:
-                        console.print("[dim]turn in flight — /note /status /cost /help work now; "
-                                      "^C cancels the turn[/]")
+                        console.print("[dim]turn in flight — /note /status /cost /tape /help work "
+                                      "now; Esc Esc or ^C cancels the turn[/]")
                         continue
                     _slash(text, renderer, console)  # may mutate renderer state (/duel)
                     continue
@@ -163,18 +190,21 @@ def _turn_line(console: Console, calls_before: int, spent_before: float, cfg: Co
     calls = trace(run_id=RUN_ID, role="head_call")[calls_before:]
     if not calls:
         return
-    icon = {"claude": "🟠", "codex": "🔵", "judge": "⚖", "compact": "⧉"}
+    icon = {"claude": cfg.claude_glyph, "codex": cfg.codex_glyph, "judge": "⚖", "compact": "⧉"}
     parts = [f"{icon.get(c.get('head'), '·')} {c.get('secs', 0):.1f}s" + ("" if c.get("ok") else " ✗")
              for c in calls]
     spent = _spent()
     delta = spent - spent_before
     over = (f"  ·  [red]⚠ over budget (${spent:.2f} > ${cfg.ask_budget_usd:.2f})[/red]"
             if cfg.ask_budget_usd and spent > cfg.ask_budget_usd else "")
-    console.print(f"[dim]{'  ·  '.join(parts)}{f'  ·  ${delta:.2f}' if delta >= 0.005 else ''}{over}[/]")
+    console.print(f"[dim]{'  ·  '.join(parts)}{f'  ·  ~${delta:.2f}' if delta >= 0.005 else ''}{over}[/]")
 
 
 def _make_prompt(renderer, cfg: Config, console: Console,
-                 busy: Callable[[], bool] = lambda: False) -> Callable[[], str]:
+                 busy: Callable[[], bool] = lambda: False,
+                 queued: Callable[[], int] = lambda: 0,
+                 esc_armed: list | None = None,
+                 on_cancel: Callable[[], None] | None = None) -> Callable[[], str]:
     """The input cockpit (C2): compact composer zone — separator bar, multiline input,
     status line — owned at the bottom while content scrolls natively above; never the
     alternate screen (the omnigent/Claude-Code principle). See composer.py.
@@ -184,13 +214,53 @@ def _make_prompt(renderer, cfg: Config, console: Console,
         # Mode you can SEE: ⚔ › while the adversary is live, › solo, both in the theme accent.
         return "⚔ ›" if getattr(renderer, "adversarial", False) else "›"
 
-    def status() -> str:
-        # Re-read per render tick, so /duel · /rounds · /judge flips show without a redraw.
+    def status() -> list:
+        # THE FLIGHT PANEL (backlog 6+7+9): fragments, re-read per 0.5s render tick, so
+        # /duel flips, head phases, the Esc confirm and queue depth all show without a
+        # redraw. While a turn runs: per-head glyph + phase + elapsed, ⚠ quiet once a
+        # head's SILENCE crosses half of head_timeout (the same idle clock the watchdog
+        # kills on — you get to judge "stuck" before the machine does), ~$ as each head's
+        # receipt lands. Dollar figures are ~estimates at API list prices (a subscription
+        # is billed by plan limits, not these numbers).
         # _spent() re-reads the ledger — cheap at solo scale, revisit if the file grows huge.
+        tb = "class:bottom-toolbar"
+        warn = f"{tb} fg:ansiyellow bold"
         duel = "⚔ duel" if getattr(renderer, "adversarial", False) else "solo"
-        working = "⏳ turn in flight · " if busy() else ""
-        return (f" — {working}{cfg.banner_title.lower()} · {duel} · rounds {cfg.rounds}"
-                f" · judge {cfg.judge_style or 'off'} · ${_spent():.2f} · ^O report · /help ")
+        frags: list[tuple[str, str]] = [(tb, " — ")]
+        if esc_armed and esc_armed[0] > time.monotonic():
+            frags.append((warn, "⚠ Esc again to cancel the turn"))
+            frags.append((tb, " · "))
+        if busy():
+            heads, _ = flight.snapshot()
+            now = time.monotonic()
+            glyphs = {"claude": cfg.claude_glyph, "codex": cfg.codex_glyph, "judge": "⚖"}
+            for head, info in heads:
+                g = glyphs.get(head, "·")
+                if info["done"]:
+                    frags.append((tb, f"{g} ✓"))
+                else:
+                    frags.append((tb, f"{g} {info['phase']} {now - info['t0']:.0f}s"))
+                    idle = now - info["beat"]
+                    if idle >= cfg.head_timeout / 2:
+                        frags.append((warn, f" ⚠ quiet {idle:.0f}s"))
+                if info["usd"] is not None:
+                    frags.append((tb, f" ~${info['usd']:.2f}"))
+                frags.append((tb, " · "))
+            if not heads:
+                frags.append((tb, "⏳ turn in flight · "))
+            if queued():
+                frags.append((tb, f"⧗ queue {queued()} · "))
+            frags.append((tb, "Esc cancels · "))
+        frags.append((tb, f"{cfg.banner_title.lower()} · {duel} · rounds {cfg.rounds}"
+                          f" · judge {cfg.judge_style or 'off'} · ~${_spent():.2f}"))
+        ctx = _context_frac(cfg)
+        if ctx is not None:
+            frags.append((tb, " · "))
+            frags.append((warn if ctx >= 0.7 else tb, f"⛁ {ctx:.0%}"))
+        if not cfg.tape_verbose:
+            frags.append((tb, " · tape off (^T)"))
+        frags.append((tb, " · ^O report · /help "))
+        return frags
 
     fallback = lambda: console.input(f"[bold {cfg.accent_color}]{marker()}[/] ")
     if not sys.stdin.isatty():
@@ -202,7 +272,20 @@ def _make_prompt(renderer, cfg: Config, console: Console,
     return Composer(console, accent=cfg.accent_color, title=cfg.banner_title.lower(),
                     marker=marker, status=status, commands=_COMMANDS,
                     history_path=cfg.ledger_path.parent / "history",
-                    on_toggle=lambda: _toggle_duel(renderer, console)).read
+                    on_toggle=lambda: _toggle_duel(renderer, console),
+                    on_cancel=on_cancel,
+                    hotkeys={"c-t": lambda: _toggle_tape(cfg, console)},
+                    arg_words=_slash_arg_words).read
+
+
+def _context_frac(cfg: Config) -> float | None:
+    """How full the fuller head's context window is, from each head's LAST call's prompt
+    tokens (flight.context_tokens). Approximate twice over — the window sizes are config
+    knobs, not CLI facts — so it renders as a meter, never a promise."""
+    _, tokens = flight.snapshot()
+    fracs = [tokens[h] / max(1, getattr(cfg, f"{h}_context_window"))
+             for h in ("claude", "codex") if h in tokens]
+    return max(fracs) if fracs else None
 
 
 def _clear_title() -> None:
@@ -258,11 +341,11 @@ def _slash(text: str, renderer, console: Console) -> None:
                       + (f"  [dim]({who} merges/weighs after each duel)[/]" if cfg.judge_style else ""))
     elif cmd == "/think":
         mode, _, val = arg.partition(" ")
-        tokens = {"off": 0, "max": 31999}.get(val.strip(), None)
+        tokens = _THINK_LEVELS.get(val.strip(), None)
         if tokens is None and val.strip().isdigit():
             tokens = min(int(val.strip()), 31999)
         if mode not in ("duel", "solo") or tokens is None:
-            console.print("[red]usage: /think <duel|solo> <tokens|max|off>[/] — "
+            console.print("[red]usage: /think <duel|solo> <low|medium|high|max|off|tokens>[/] — "
                           f"now duel {cfg.duel_thinking_tokens} · solo {cfg.solo_thinking_tokens}")
             return
         setattr(cfg, f"{mode}_thinking_tokens", tokens)
@@ -280,12 +363,14 @@ def _slash(text: str, renderer, console: Console) -> None:
         console.print(f"{mode} tools = {val.strip()}"
                       + ("  [dim](read-only: files + web search, no shell)[/]"
                          if val.strip() == "on" else ""))
+    elif cmd == "/tape":
+        _toggle_tape(cfg, console)
     elif cmd == "/status":
         _status(renderer, console)
     elif cmd == "/cost":
         _cost(console)
     elif cmd == "/last":
-        _last(console)
+        _last(cfg, console)
     elif cmd == "/switch":
         if _switch(arg, console) and _disarm(renderer):
             console.print("[dim]⚔ duel off — new conversation starts solo (/duel re-arms)[/]")
@@ -333,6 +418,18 @@ def _toggle_duel(renderer, console: Console, arg: str | None = None) -> None:
                   "  [dim](Shift+Tab or /duel turns it off)[/]"
                   if renderer.adversarial else
                   "adversary off — plain claude chat  [dim](Shift+Tab or /duel re-arms)[/]")
+
+
+def _toggle_tape(cfg: Config, console: Console) -> None:
+    """Ctrl+T / /tape (backlog item: the Ctrl+O-verbose pattern, ^O being taken by /report):
+    flip the dim thinking/tool/retry lines live, MID-TURN included — it only gates prints,
+    so the running pump honors it on its next event. Phases stay on the status line either
+    way: hiding the tape loses the text, never the liveness."""
+    cfg.tape_verbose = not cfg.tape_verbose
+    console.print("tape on — thinking/tool lines stream dim  [dim](Ctrl+T or /tape hides)[/]"
+                  if cfg.tape_verbose else
+                  "tape off — answers only; the status line still shows phases  "
+                  "[dim](Ctrl+T or /tape brings it back)[/]")
 
 
 def _disarm(renderer) -> bool:
@@ -414,7 +511,7 @@ def _spent() -> float:
     return sum(r.get("usd") or 0.0 for r in trace(run_id=RUN_ID, role="head_cost"))
 
 
-def _last(console: Console) -> None:
+def _last(cfg: Config, console: Console) -> None:
     """Reprint the previous turn — columns for a duel, one voice for solo, verdict if judged.
     The `"proposer" in r` guard skips event rows (converged/cancelled share role=debate)."""
     turns = [r for r in trace(run_id=RUN_ID, role="debate")
@@ -425,9 +522,9 @@ def _last(console: Console) -> None:
     last = turns[-1]
     if last.get("adversary"):
         from .debate import _present
-        _present(console, str(last.get("proposer", "")), str(last["adversary"]))
+        _present(console, str(last.get("proposer", "")), str(last["adversary"]), cfg)
     else:
-        console.print(f"[orange1]## 🟠 Claude[/]\n{last.get('proposer', '')}")
+        console.print(f"[orange1]## {cfg.claude_glyph} Claude[/]\n{last.get('proposer', '')}")
     judges = trace(run_id=RUN_ID, role="judge")
     if judges and judges[-1].get("ts", 0) > last.get("ts", 0):
         console.print(f"\n[bold]## ⚖ Synthesis[/] ({judges[-1].get('style')})\n{judges[-1].get('text', '')}")
@@ -549,43 +646,124 @@ def _history(cfg: Config, console: Console) -> None:
     _view(console, cfg, "history — what the heads remember", body)
 
 
+def _slash_arg_words(cmd: str, idx: int, prior: list[str]) -> tuple[str, ...]:
+    """Finite vocabulary for the idx-th argument of `cmd` — feeds the composer's
+    completion popup so switching models/effort/thinking is a Tab away instead of
+    memorized syntax (12 Jul ask). Empty tuple = free-text argument, no popup."""
+    if cmd == "/model":
+        if idx == 0:
+            return ("claude", "codex", "reset")
+        if idx == 1 and prior[:1] == ["claude"]:
+            return tuple(_CLAUDE_ALIASES) + ("reset",)
+        if idx == 1 and prior[:1] == ["codex"]:
+            return _CODEX_SUGGEST + ("reset",)
+    elif cmd == "/effort" and idx == 0:
+        return _EFFORTS + ("reset",)
+    elif cmd in ("/think", "/tools") and idx == 0:
+        return ("duel", "solo")
+    elif cmd == "/think" and idx == 1:
+        return tuple(_THINK_LEVELS)
+    elif cmd == "/tools" and idx == 1:
+        return ("on", "off")
+    elif cmd == "/judge" and idx == 0:
+        return ("off", "moderator", "reasoning")
+    elif cmd == "/duel" and idx == 0:
+        return ("on", "off")
+    return ()
+
+
+# Friendly shorthands → real IDs. Anything NOT here still ships verbatim, so new models
+# work the day they exist; the table only saves typing for the ones people reach for.
+_CLAUDE_ALIASES = {"opus": "claude-opus-4-8", "sonnet": "claude-sonnet-5",
+                   "haiku": "claude-haiku-4-5", "fable": "claude-fable-5"}
+_CODEX_SUGGEST = ("gpt-5.5",)      # completion bait only — codex names always ship verbatim
+
+
+def _cli_default(head: str) -> str | None:
+    """What 'CLI default' actually resolves to, best-effort — /model must answer
+    'default of WHAT?' (12 Jul ask). Display-only: any missing/odd file → None,
+    because peeking at the vendors' config files must never break the REPL."""
+    try:
+        if head == "claude":
+            return json.loads((Path.home() / ".claude" / "settings.json")
+                              .read_text()).get("model")
+        m = re.search(r'^\s*model\s*=\s*"([^"]+)"',
+                      (Path.home() / ".codex" / "config.toml").read_text(), re.M)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _guess_head(name: str) -> str | None:
+    """`/model opus` shouldn't demand a head word when the name already says it."""
+    if name in _CLAUDE_ALIASES or name.startswith("claude"):
+        return "claude"
+    if name.startswith(("gpt", "o1", "o3", "o4", "codex")):
+        return "codex"
+    return None
+
+
 def _model(arg: str, cfg: Config, console: Console) -> None:
-    """Per-head model override, next turn onward. Values ship VERBATIM — no catalog to
-    validate against, so warn-never-block (↔ omnigent _repl.py:4990): a wrong name fails
-    loud on the next turn and lands in the ledger as a head_call error."""
+    """Per-head model override, next turn onward. Aliases (opus·sonnet·haiku·fable) expand;
+    everything else ships VERBATIM — no catalog to validate against, so warn-never-block
+    (↔ omnigent _repl.py:4990): a wrong name fails loud on the next turn and lands in the
+    ledger as a head_call error. `/model opus` infers the head from the name."""
     words = arg.split()
     if not words:
-        console.print(f"claude: [bold]{cfg.claude_model or 'CLI default'}[/] · "
-                      f"codex: [bold]{cfg.codex_model or 'CLI default'}[/]"
-                      "  [dim](/model claude|codex <name> · /model reset)[/]")
+        for head in ("claude", "codex"):
+            override = getattr(cfg, f"{head}_model")
+            fallback = _cli_default(head)
+            console.print(f"{head}: [bold]{override or 'CLI default'}[/]"
+                          + (f"  [dim](→ {fallback})[/]" if not override and fallback else ""))
+        console.print(f"[dim]/model claude {'·'.join(_CLAUDE_ALIASES)}|<id> · "
+                      f"/model codex <id> · /model reset[/]")
         return
     if words[0] in ("reset", "off", "default"):
         cfg.claude_model = cfg.codex_model = None
         console.print("models reset — each CLI picks its own default again")
         return
+    if len(words) == 1:                       # `/model opus` — the name names the head
+        head = _guess_head(words[0])
+        if head is None:
+            console.print("[red]usage: /model · /model \\[claude|codex] <name> · /model reset[/]"
+                          "  [dim](couldn't tell which head that name belongs to)[/]")
+            return
+        words = [head, words[0]]
     if len(words) == 2 and words[0] in ("claude", "codex"):
-        setattr(cfg, f"{words[0]}_model", words[1])
-        console.print(f"{words[0]} model = [bold]{words[1]}[/]  [dim](verbatim — a bad name fails"
-                      " on the next turn; /model reset undoes)[/]")
+        head, name = words
+        if name in ("reset", "off", "default"):
+            setattr(cfg, f"{head}_model", None)
+            console.print(f"{head} model reset — its CLI picks the default again"
+                          + (f"  [dim](→ {_cli_default(head)})[/]" if _cli_default(head) else ""))
+            return
+        resolved = _CLAUDE_ALIASES.get(name, name) if head == "claude" else name
+        setattr(cfg, f"{head}_model", resolved)
+        console.print(f"{head} model = [bold]{resolved}[/]"
+                      + (f"  [dim]({name} →)[/]" if resolved != name else "")
+                      + "  [dim](verbatim — a bad name fails on the next turn; /model reset undoes)[/]")
         return
-    console.print("[red]usage: /model · /model claude|codex <name> · /model reset[/]")
+    console.print("[red]usage: /model · /model \\[claude|codex] <name> · /model reset[/]")
 
 
-_EFFORTS = ("minimal", "low", "medium", "high")
+_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+# Claude thinking shorthands: low/medium mirror Claude Code's think/megathink tiers,
+# max is the ultrathink cap, high sits between as a budget (the knob is continuous).
+_THINK_LEVELS = {"off": 0, "low": 4000, "medium": 10000, "high": 16000, "max": 31999}
 
 
 def _effort(arg: str, cfg: Config, console: Console) -> None:
     """Codex reasoning effort (`-c model_reasoning_effort=…`). Codex-only and says so —
-    claude -p has no effort knob (extended thinking is prompt-level, not a flag)."""
+    claude -p has no effort knob (thinking budgets ride /think instead)."""
     if not arg:
         console.print(f"codex effort: [bold]{cfg.codex_effort or 'CLI default'}[/]"
-                      f"  [dim](/effort {'·'.join(_EFFORTS)} · reset — codex only)[/]")
+                      f"  [dim](/effort {'·'.join(_EFFORTS)} · reset — codex only;"
+                      " claude: /think)[/]")
     elif arg in ("reset", "off", "default"):
         cfg.codex_effort = None
         console.print("codex effort reset to the CLI default")
     elif arg in _EFFORTS:
         cfg.codex_effort = arg
-        console.print(f"codex effort = [bold]{arg}[/]  [dim](claude unaffected — no such knob on claude -p)[/]")
+        console.print(f"codex effort = [bold]{arg}[/]  [dim](claude unaffected — its depth is /think)[/]")
     else:
         console.print(f"[red]usage: /effort {'|'.join(_EFFORTS)}|reset[/]")
 

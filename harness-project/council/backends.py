@@ -10,8 +10,27 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from . import flight
 from .config import Config
 from .ledger import record
+
+
+def _context_beat(head: str, usage: dict | None) -> None:
+    """Feed the flight panel's context meter from a call's usage block. Claude reports
+    cache reads/writes SEPARATELY from input_tokens (API semantics); codex's input_tokens
+    already includes its cached share. Wrong-shaped usage must never kill a head."""
+    if not isinstance(usage, dict):
+        return
+    try:
+        if head == "claude":
+            used = sum(int(usage.get(k) or 0) for k in
+                       ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+        else:
+            used = int(usage.get("input_tokens") or 0)
+    except (TypeError, ValueError):
+        return
+    if used > 0:
+        flight.context_tokens(head, used)
 
 _HEAD_PROMPT_BASE = """\
 You are one of two voices in a council. You are a thinking-and-writing responder.
@@ -127,6 +146,7 @@ def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None,
         usd = payload.get("total_cost_usd")
         if isinstance(usd, (int, float)) and not isinstance(usd, bool):
             record({"role": "head_cost", "head": "claude", "usd": float(usd)})
+        _context_beat("claude", payload.get("usage"))
         if session is not None and payload.get("session_id"):
             session.claude = str(payload["session_id"])   # authoritative id (mint OR resume)
         return str(payload["result"]).strip()
@@ -186,6 +206,7 @@ def _codex_events(raw: str, session: HeadSessions) -> str:
             usage = e["usage"]
     if usage:
         record({"role": "head_cost", "head": "codex", "tokens": usage})
+        _context_beat("codex", usage)
     return "\n\n".join(t for t in texts if t).strip() or raw
 
 
@@ -246,6 +267,7 @@ def _claude_events(e: dict, session: HeadSessions | None):
         # block-era stub) that answers a stream request in one JSON line still lands.
         if session is not None and e.get("session_id"):
             session.claude = str(e["session_id"])
+        _context_beat("claude", e.get("usage"))
         usd = e.get("total_cost_usd")
         if isinstance(usd, (int, float)) and not isinstance(usd, bool):
             record({"role": "head_cost", "head": "claude", "usd": float(usd)})
@@ -304,6 +326,7 @@ def _codex_stream_events(e: dict, session: HeadSessions | None):
                                     "input": str(item.get("query") or "")[:200]})
     elif t == "turn.completed" and isinstance(e.get("usage"), dict):
         record({"role": "head_cost", "head": "codex", "tokens": e["usage"]})
+        _context_beat("codex", e["usage"])
         yield _ev("codex", "cost", {"tokens": e["usage"]})
     elif t in ("turn.failed", "error"):
         raise RuntimeError(f"codex turn failed: {str(e)[:300]}")
@@ -319,7 +342,8 @@ def _run_lines(argv: list[str], cfg: Config, stdin: str = "", env: dict | None =
     holding the pipe otherwise). stderr is read after EOF (heads keep it small — a >64KB
     flood would deadlock, accepted). Early generator close kills the child in the finally."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, start_new_session=True,
+                            stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+                            start_new_session=True,
                             env={**os.environ, **env} if env else None)
     with _ILOCK:
         _INFLIGHT.add(proc)
@@ -372,7 +396,8 @@ def _run(argv: list[str], cfg: Config, stdin: str = "", env: dict | None = None)
     "additional input from stdin" and fight run_loop for keystrokes (verified 4 Jul).
     `env` = EXTRA vars layered over the inherited environment (depth pack: MAX_THINKING_TOKENS)."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, start_new_session=True,
+                            stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+                            start_new_session=True,
                             env={**os.environ, **env} if env else None)
     with _ILOCK:
         _INFLIGHT.add(proc)
