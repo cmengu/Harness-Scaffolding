@@ -23,7 +23,8 @@ from . import flight
 from .backends import (Cancelled, HeadSessions, _classify, adversary,
                        adversary_stream, kill_inflight, proposer, proposer_stream)
 from .config import Config
-from .ledger import chain_rows, quarantine, record
+from .ledger import (chain_rows, head_call, head_error, head_retry, quarantine,
+                     record)
 
 
 @dataclass
@@ -223,21 +224,20 @@ def _safe(fn, msg, cfg, label, sessions=None):
                 kind = _classify(e)
                 if kind == "permanent" or attempt >= cfg.head_retries:
                     raise                   # permanent = retrying is failing slowly; else exhausted
-                record({"role": "head_retry", "head": label, "attempt": attempt,
-                        "kind": kind, "error": str(e)[:500]})   # rows = retries actually taken
+                record(head_retry(label, attempt, kind=kind, error=str(e)[:500]))   # rows = retries taken
                 time.sleep(cfg.retry_base_delay * 2 ** attempt)
-        record({"role": "head_call", "head": label, "ok": True, "attempts": attempts,
-                "secs": round(time.monotonic() - t0, 2)})
+        record(head_call(label, ok=True, attempts=attempts,
+                         secs=round(time.monotonic() - t0, 2)))
         return out
     except Cancelled:                       # user's ^C, not a failure: no head_error row (replay
-        record({"role": "head_call", "head": label, "ok": False, "cancelled": True,
-                "secs": round(time.monotonic() - t0, 2)})   # stays clean), /report skips it
+        record(head_call(label, ok=False, cancelled=True,
+                         secs=round(time.monotonic() - t0, 2)))   # stays clean), /report skips it
         return f"_({label} cancelled)_"
     except Exception as e:
         friendly = _err_text(e, cfg)
-        record({"role": "head_call", "head": label, "ok": False,
-                "secs": round(time.monotonic() - t0, 2), "error": friendly[:500]})
-        record({"role": "head_error", "head": label, "kind": kind, "error": friendly})
+        record(head_call(label, ok=False,
+                         secs=round(time.monotonic() - t0, 2), error=friendly[:500]))
+        record(head_error(label, kind=kind, error=friendly))
         quarantine(label, e, {"kind": kind, "attempts": attempts, "question": msg})
         if sessions is not None:
             sessions.clear(label)
@@ -415,26 +415,25 @@ def _safe_stream(fn, msg, cfg, label, sessions=None):
             for ev in fn(msg, cfg):
                 visible = visible or ev["kind"] in ("text", "final")
                 yield ev
-            record({"role": "head_call", "head": label, "ok": True, "attempts": attempt + 1,
-                    "secs": round(time.monotonic() - t0, 2), "stream": True})
+            record(head_call(label, ok=True, attempts=attempt + 1,
+                             secs=round(time.monotonic() - t0, 2), stream=True))
             return
         except Cancelled:
-            record({"role": "head_call", "head": label, "ok": False, "cancelled": True,
-                    "secs": round(time.monotonic() - t0, 2), "stream": True})
+            record(head_call(label, ok=False, cancelled=True,
+                             secs=round(time.monotonic() - t0, 2), stream=True))
             yield _ev(label, "error", {"cancelled": True})
             return
         except Exception as e:
             kind = _classify(e)
             friendly = _err_text(e, cfg)
             if kind == "transient" and attempt < cfg.head_retries and not visible:
-                record({"role": "head_retry", "head": label, "attempt": attempt,
-                        "kind": kind, "error": friendly[:500]})
+                record(head_retry(label, attempt, kind=kind, error=friendly[:500]))
                 yield _ev(label, "retry", {"attempt": attempt + 1, "error": friendly[:200]})
                 time.sleep(cfg.retry_base_delay * 2 ** attempt)
                 continue
-            record({"role": "head_call", "head": label, "ok": False, "stream": True,
-                    "secs": round(time.monotonic() - t0, 2), "error": friendly[:500]})
-            record({"role": "head_error", "head": label, "kind": kind, "error": friendly})
+            record(head_call(label, ok=False, stream=True,
+                             secs=round(time.monotonic() - t0, 2), error=friendly[:500]))
+            record(head_error(label, kind=kind, error=friendly))
             quarantine(label, e, {"kind": kind, "attempts": attempt + 1, "question": msg})
             if sessions is not None:
                 sessions.clear(label)

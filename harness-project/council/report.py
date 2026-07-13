@@ -10,7 +10,8 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from .ledger import trace
+from .ledger import (cost_usd, is_head_call, is_head_error, is_head_retry,
+                     trace)
 
 
 def summary(days: int = 7):
@@ -23,11 +24,11 @@ def summary(days: int = 7):
     for r in rows:                                   # rows born before run IDs group as one bucket
         runs.setdefault(r.get("run_id", "pre-run-id"), []).append(r)
 
-    calls = [r for r in rows if r.get("role") == "head_call"]
+    calls = [r for r in rows if is_head_call(r)]
     fails = [c for c in calls if not c.get("ok") and not c.get("cancelled")]   # a ^C isn't a failure
-    retries = sum(1 for r in rows if r.get("role") == "head_retry")
+    retries = sum(1 for r in rows if is_head_retry(r))
     lat = sorted(c.get("secs", 0.0) for c in calls if c.get("ok"))
-    ask_usd = sum(r.get("usd") or 0.0 for r in rows if r.get("role") == "head_cost")
+    ask_usd = sum(cost_usd(r) for r in rows)             # cost_usd(codex) is now priced, not 0
     # code-mode cost: statusLine's total_cost_usd is a RUNNING session total —
     # take the max per run and sum those; summing rows would overcount by ~turns.
     code_usd = sum(m for m in (_code_total(rs) for rs in runs.values()) if m)
@@ -45,8 +46,8 @@ def summary(days: int = 7):
     for col in ("run", "started", "mode", "turns", "cost", "errors"):
         per.add_column(col, justify="right" if col in ("turns", "cost", "errors") else "left")
     for rid, rs in sorted(runs.items(), key=lambda kv: kv[1][0].get("ts", 0))[-15:]:
-        errors = sum(1 for r in rs if r.get("role") == "head_error")
-        cost = sum(r.get("usd") or 0.0 for r in rs if r.get("role") == "head_cost") + (_code_total(rs) or 0.0)
+        errors = sum(1 for r in rs if is_head_error(r))
+        cost = sum(cost_usd(r) for r in rs) + (_code_total(rs) or 0.0)
         per.add_row(rid, time.strftime("%d %b %H:%M", time.localtime(rs[0].get("ts", 0))), _mode(rs),
                     str(sum(1 for r in rs if r.get("role") in ("user", "code_user"))),
                     f"${cost:.2f}" if cost else "—", str(errors) if errors else "—")
@@ -89,10 +90,10 @@ def render_rows(rows: list[dict], console: Console) -> None:
             console.print(f"[orange1]{r.get('text', '')}[/]")
         elif role == "code_tool":
             console.print(f"[dim]⚙ {r.get('name')}  {r.get('summary', '')}[/]")
-        elif role == "head_retry":
+        elif is_head_retry(r):
             console.print(f"[dim]↻ {r.get('head')} retry {r.get('attempt', 0) + 1}"
                           f" ({r.get('kind')}): {str(r.get('error'))[:120]}[/]")
-        elif role == "head_error":
+        elif is_head_error(r):
             console.print(f"[red]✗ {r.get('head')}: {str(r.get('error'))[:200]}[/]")
         elif role == "quarantined":
             console.print(f"[red]☠ postmortem → {r.get('path')}[/]")

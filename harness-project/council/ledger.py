@@ -348,6 +348,7 @@ def is_syco_flag(row) -> bool: return _is(row, "syco_flag")
 
 def cost_usd(row) -> float:
     """The normalized cost reader: dollars from a head_cost row, 0.0 for anything else, so
-    `sum(cost_usd(r) for r in rows)` totals a mixed-head run. Token-only rows contribute 0
-    until a token→usd rate lands with the consuming ticket."""
+    `sum(cost_usd(r) for r in rows)` totals a mixed-head run. Both heads now write a usd
+    figure (claude billed direct; codex priced from tokens at write time — backends.codex_usd),
+    so codex spend is included. Pre-#4 codex rows carry only tokens and read as 0.0."""
     return float(row.get("usd") or 0.0) if is_cost(row) else 0.0

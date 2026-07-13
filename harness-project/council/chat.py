@@ -16,7 +16,8 @@ from rich.table import Table
 
 from . import flight
 from .config import Config
-from .ledger import RUN_ID, chain_rows, record, sessions, start_session, trace
+from .ledger import (RUN_ID, chain_rows, cost_usd, record, sessions,
+                     start_session, trace)
 
 # One table drives /help AND the completion popup — they can never drift apart.
 _COMMANDS: list[tuple[str, str, str]] = [
@@ -368,7 +369,7 @@ def _slash(text: str, renderer, console: Console) -> None:
     elif cmd == "/status":
         _status(renderer, console)
     elif cmd == "/cost":
-        _cost(console)
+        _cost(cfg, console)
     elif cmd == "/last":
         _last(cfg, console)
     elif cmd == "/switch":
@@ -501,14 +502,21 @@ def _status(renderer, console: Console) -> None:
     console.print(t)
 
 
-def _cost(console: Console) -> None:
+def _cost(cfg: Config, console: Console) -> None:
+    from .pricing import codex_rate
     calls = trace(run_id=RUN_ID, role="head_call")
-    console.print(f"session {RUN_ID}: [bold]${_spent():.2f}[/] across {len(calls)} head call(s)"
-                  "  [dim](claude head only — codex's CLI exposes no per-call cost)[/]")
+    console.print(f"session {RUN_ID}: [bold]${_spent():.2f}[/] across {len(calls)} head call(s)")
+    if not cfg.codex_pricing:
+        note = "codex priced OFF (token-only)"
+    else:
+        (p_in, _c, p_out), model, exact = codex_rate(cfg.codex_model)
+        assumed = "" if exact else " ⚠ assumed — unknown model, rate may be stale"
+        note = (f"codex @ {model} list ${p_in:g}/${p_out:g} per 1M in/out{assumed}")
+    console.print(f"  [dim]claude billed direct · {note}[/]")
 
 
 def _spent() -> float:
-    return sum(r.get("usd") or 0.0 for r in trace(run_id=RUN_ID, role="head_cost"))
+    return sum(cost_usd(r) for r in trace(run_id=RUN_ID, role="head_cost"))
 
 
 def _last(cfg: Config, console: Console) -> None:
