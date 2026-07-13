@@ -19,13 +19,15 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
+from . import contract as contract_tpl
 from . import flight
 from .backends import (Cancelled, HeadSessions, _classify, adversary,
-                       adversary_stream, kill_inflight, proposer, proposer_stream)
+                       adversary_stream, kill_inflight, proposer, proposer_stream,
+                       trailer_retry)
 from .config import Config
 from .ledger import (briefing, debate_event, debate_round, head_call, head_error,
                      head_retry, head_session, judge as judge_row, judge_keymap,
-                     quarantine, record)
+                     quarantine, record, trailer as trailer_row)
 from . import preamble
 
 
@@ -66,6 +68,36 @@ def _split_verdict(text: str) -> tuple[str, str]:
     return "", text.strip()
 
 
+def _contract_pass(head, raw, round_no, sessions, cfg, console):
+    """The output contract's in-round machinery: slice the `=== TRAILER ===` block off a head's
+    answer, validate it against the schema, and on failure fire ONE corrective retry on the same
+    session (native schema flag attached). Still failing → degrade, never die: keep the prose,
+    store the trailer raw, mark the ledger row unparsed, dim ⚠ on the tape. Records the trailer
+    row via the constructor. Returns (body_without_trailer, parsed_or_None). A dead head has no
+    answer to parse — passed through untouched so run()'s dead-reply path still fires on it."""
+    if preamble.is_dead(raw):
+        return raw, None
+    body, raw_trailer = contract_tpl.split_trailer(raw)
+    parsed = contract_tpl.parse_trailer(raw_trailer, round_no)
+    if parsed is None and sessions is not None and getattr(sessions, head, None):
+        record(head_retry(head, 0, kind="trailer"))          # a corrective retry was fired
+        parsed = contract_tpl.parse_trailer(
+            trailer_retry(head, sessions, cfg, round_no), round_no)
+    if parsed is not None:
+        record(trailer_row(head, round_no, parsed=parsed))
+    else:
+        record(trailer_row(head, round_no, raw=raw_trailer or raw))
+        console.print(f"[dim]⚠ {head} trailer unparsed — prose kept, stance features skip[/]")
+    return body, parsed
+
+
+def _opp_conf(conf_val) -> str:
+    """The opponent-confidence line woven into a round-N message so each head prices in how sure
+    the other side is (user story 15). Empty when the opponent left no parsed confidence."""
+    return ("" if conf_val is None
+            else f"The other voice stated confidence {conf_val:.2f} in its position.\n")
+
+
 def _duel_depth(cfg: Config) -> dict:
     """The armed profile (locked 10-11 Jul): claude thinks at the configured max, codex at
     /effort or high, both heads may research. Solo turns build their own cheaper dict."""
@@ -98,7 +130,13 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         q_b = (seed if sessions.codex is None else "") + question
     else:
         q_a = q_b = seeded
-    a, b = both(q_a, q_b, round_no=0)                                   # round 0 (ANSWER mode)
+    con0 = contract_tpl.injection(0) if cfg.contract else ""            # round-0 contract, both heads
+    a, b = both(q_a, q_b, round_no=0, con_a=con0, con_b=con0)           # round 0 (ANSWER mode)
+    conf = {"claude": None, "codex": None}                             # opponent confidence carry
+    if cfg.contract:
+        a, ta = _contract_pass("claude", a, 0, sessions, cfg, console)
+        b, tb = _contract_pass("codex", b, 0, sessions, cfg, console)
+        conf = {"claude": contract_tpl.confidence(ta), "codex": contract_tpl.confidence(tb)}
     record(debate_round(0, a, b))
     dead = [h for h, t in (("claude", a), ("codex", b)) if preamble.is_dead(t)]
     if dead:                                # a dead round 0 ends the debate — critiquing a
@@ -116,15 +154,21 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         # per head at default rounds=1). The reply carries scratch critique + ===ANSWER===
         # + a standalone answer — any round may end the duel (early-stop), so EVERY round's
         # answer must stand alone.
+        # Each head is shown its opponent's stated confidence (claude's opponent = codex).
+        oc_a, oc_b = _opp_conf(conf["codex"]), _opp_conf(conf["claude"])
         if sessions is not None:
-            msg_a = f"The other voice said:\n{prev_b}\n\n{_CRIT_INSTR}"
-            msg_b = f"The other voice said:\n{prev_a}\n\n{_CRIT_INSTR}"
+            msg_a = f"The other voice said:\n{prev_b}\n{oc_a}\n{_CRIT_INSTR}"
+            msg_b = f"The other voice said:\n{prev_a}\n{oc_b}\n{_CRIT_INSTR}"
         else:
             # Question (incl. seed) stays in EVERY round — a stateless head otherwise
             # drifts into critiquing prose style
-            msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n\n{_CRIT_INSTR}"
-            msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n\n{_CRIT_INSTR}"
-        raw_a, raw_b = both(msg_a, msg_b, round_no=n)
+            msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n{oc_a}\n{_CRIT_INSTR}"
+            msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n{oc_b}\n{_CRIT_INSTR}"
+        con_a = contract_tpl.injection(n, opponent_confidence=conf["codex"],
+                                       final_round=(n == rounds)) if cfg.contract else ""
+        con_b = contract_tpl.injection(n, opponent_confidence=conf["claude"],
+                                       final_round=(n == rounds)) if cfg.contract else ""
+        raw_a, raw_b = both(msg_a, msg_b, round_no=n, con_a=con_a, con_b=con_b)
         died = [h for h, t in (("claude", raw_a), ("codex", raw_b)) if preamble.is_dead(t)]
         if died:                             # mid-debate death: keep the last GOOD answers
             record(debate_event("round_failed", round=n, dead=died))
@@ -132,6 +176,10 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
                           "keeping the previous round's answers[/]")
             a, b = prev_a, prev_b
             break
+        if cfg.contract:                     # strip + validate trailers BEFORE splitting prose
+            raw_a, ta = _contract_pass("claude", raw_a, n, sessions, cfg, console)
+            raw_b, tb = _contract_pass("codex", raw_b, n, sessions, cfg, console)
+            conf = {"claude": contract_tpl.confidence(ta), "codex": contract_tpl.confidence(tb)}
         crit_a, a = _split_verdict(raw_a)
         crit_b, b = _split_verdict(raw_b)
         # the deliverable (proposer/adversary) stays clean; the scratch critiques survive
@@ -149,18 +197,20 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     return result
 
 
-def _both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0, live=True):
+def _both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0, live=True,
+          con_a="", con_b=""):
     """Both heads concurrently with a live per-head status (block-then-present; columns can't
     stream-interleave). The classic path (stream_tape=false); round_no is the tape's cue and
-    is ignored here. ^C here lands in the MAIN thread (this spinner loop) while the heads
+    is ignored here. `con_a`/`con_b` = the per-head output contract injected on this call (empty
+    when contract is off). ^C here lands in the MAIN thread (this spinner loop) while the heads
     run in workers — kill the subprocesses FIRST (their communicate() unblocks, each worker
     finishes via _safe's Cancelled branch), THEN re-raise; otherwise pool.__exit__ blocks
     forever waiting on workers stuck in communicate()."""
     depth = depth or {}
     pa = partial(proposer, session=sessions,
-                 thinking=depth.get("thinking", 0), tools=depth.get("tools", False))
+                 thinking=depth.get("thinking", 0), tools=depth.get("tools", False), contract=con_a)
     pb = partial(adversary, session=sessions,
-                 effort=depth.get("effort"), tools=depth.get("tools", False))
+                 effort=depth.get("effort"), tools=depth.get("tools", False), contract=con_b)
     flight.begin("claude", "thinking")       # coarse: subprocesses give no events until done,
     flight.begin("codex", "thinking")        # so idle == elapsed here (matches _run's wall clock)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -242,7 +292,8 @@ def _glyph(cfg, head):
     return cfg.claude_glyph if head == "claude" else cfg.codex_glyph
 
 
-def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0, live=True):
+def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0, live=True,
+                 con_a="", con_b=""):
     """The tape (step 5): both heads stream CONCURRENTLY into ONE scroll column —
     docker-compose-logs, not side-by-side panes (decision 10 Jul). Thinking/tool/retry
     lines print dim the moment they happen and interleave freely; ANSWER prose buffers
@@ -254,10 +305,10 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
     depth = depth or {}
     q: queue.Queue = queue.Queue()
     streams = {
-        "claude": partial(proposer_stream, session=sessions,
-                          thinking=depth.get("thinking", 0), tools=depth.get("tools", False)),
-        "codex": partial(adversary_stream, session=sessions,
-                         effort=depth.get("effort"), tools=depth.get("tools", False)),
+        "claude": partial(proposer_stream, session=sessions, thinking=depth.get("thinking", 0),
+                          tools=depth.get("tools", False), contract=con_a),
+        "codex": partial(adversary_stream, session=sessions, effort=depth.get("effort"),
+                         tools=depth.get("tools", False), contract=con_b),
     }
     def worker(label, fn, msg):
         try:

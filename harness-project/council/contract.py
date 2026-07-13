@@ -1,0 +1,210 @@
+"""council/contract.py — the output contract, taught by injection.
+
+The single source of truth for contract *content* is `docs/output-contract.md`; this module
+operationalizes it. One in-council template (three variants: round-0 · round-N · judge) is
+generated fresh on every ARMED call and injected — never written into the user's repo, never
+part of the Preamble replay (backends carry it: claude via --append-system-prompt-file, codex
+as a prefix on the composed message). After the head answers, council slices the
+`=== TRAILER ===` block off the tail and validates it here; the duel loop owns the retry/degrade.
+
+Nothing here calls a model or touches the ledger — pure text in, structured data out — so the
+template, the slicer, and the validator all unit-test as plain functions.
+"""
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import tempfile
+
+TRAILER_MARK = "=== TRAILER ==="
+
+# ── the community prompt-line pack (docs/debate-techniques-2026-07-12.md), woven into every
+#    critique-round variant: anti-deference, refute-by-reproduction, agreement-without-a-new-
+#    argument-fails. Distilled to three lines so the contract IS the debate skill. ──────────
+_PROMPT_PACK = """\
+- Do NOT defer to the other voice because it sounds confident or authoritative — weigh the argument, not the tone.
+- REFUTE BY REPRODUCTION: to reject a claim, reproduce the reasoning or name the fact that breaks it — never a bare "this is wrong".
+- Agreement that adds no new argument does not count: only concede when you can name the checkable evidence that moved you."""
+
+# The contract answer structure. Marker convention `=== NAME ===` extends the existing
+# `===ANSWER===` family. Body sections are parsed best-effort (tape niceties); ONLY the trailer
+# is validated. Emission order = the order below.
+_SECTIONS_ROUND0 = """\
+=== POSITION ===
+One line: your stance.
+=== CLAIMS ===
+One block per claim: `[id] (conf 0-1) <text>` then `evidence:` the named fact or source and
+`falsified-by:` the observation that would prove it wrong. A generic condition ("if new evidence
+emerges") counts as MISSING — name a concrete one.
+=== ANSWER ===
+Your full standalone answer. No reference to the other voice; it must read on its own.
+=== ARTIFACT ===
+none
+=== TRAILER ===
+A single JSON object, LAST, nothing after it:
+{"position": "<your stance>", "confidence": <0-1>,
+ "claims": [{"id": "<id>", "confidence": <0-1>, "falsified_by": "<observation>"}]}"""
+
+_SECTIONS_ROUNDN = """\
+=== DELIBERATION ===
+Your working — PROCESS, NOT PRODUCT. Engage each of the other voice's claims and every criticism
+you received; refute by reproduction; adopt a criticism only with checkable evidence, and say so.
+This streams as your visible thinking and NEVER appears in the answer deliverable.
+=== POSITION ===
+One line: your stance now.
+=== CLAIMS ===
+(Optional refresh, same shape as before.)
+=== ANSWER ===
+Your full standalone answer. No reference to the other voice or this debate; it must read on its own.
+=== ARTIFACT ===
+`none`, or — final round only, if the question is visual/interactive or better shown than told —
+exactly one fenced ```html block that is fully self-contained (inline CSS/JS, no external requests).
+=== TRAILER ===
+A single JSON object, LAST, nothing after it. It carries the FORMAL critique record — the
+stance-by-stance verdicts argued above are committed HERE, never in the answer:
+{"position": "<your stance>", "confidence": <0-1>,
+ "claims": [{"id": "<id>", "confidence": <0-1>, "falsified_by": "<observation>"}],
+ "stances": [{"on": "<the other voice's claim>", "stance": "SUPPORT|REFUTE|UNCERTAIN", "evidence": "<fact>"}],
+ "concessions": [{"adopted": "<what you adopted>", "evidence": "<checkable fact that moved you>"}]}"""
+
+_JUDGE = """\
+You are the judge of a duel. Read both answers blind and emit ONLY a JSON trailer, last:
+{"verdict": "agree|differ|ruling", "escalated": <bool>, "ruling": "<if you ruled>",
+ "digest": "<one-paragraph synthesis>", "confidence": <0-1>}"""
+
+
+def injection(round_no: int, *, opponent_confidence: float | None = None,
+              judge: bool = False, final_round: bool = False) -> str:
+    """The contract text for one armed call. round 0 = opening shape (no deliberation, no
+    stances, ARTIFACT none); round N = the critique shape with the prompt pack and, when known,
+    the opponent's stated confidence so the debate prices in how sure the other side is."""
+    if judge:
+        return _JUDGE
+    head = ("You are one of two voices in a council duel. Answer in the sections below, IN ORDER, "
+            "each on its own line beginning with its `=== NAME ===` marker. The trailer is the "
+            "machine-authoritative copy: if prose and trailer ever disagree, the trailer wins.")
+    if round_no <= 0:
+        return f"{head}\n\n{_SECTIONS_ROUND0}"
+    conf = ("" if opponent_confidence is None
+            else f"\n\nThe other voice stated confidence {opponent_confidence:.2f} in its position — "
+                 "weigh that, do not simply defer to it.")
+    tail = "" if final_round else ("\n\nThis is not the final round: keep ARTIFACT as `none`.")
+    return f"{head}\n\n{_PROMPT_PACK}{conf}\n\n{_SECTIONS_ROUNDN}{tail}"
+
+
+# ── trailer slicing + validation ─────────────────────────────────────────────────────────
+def split_trailer(text: str) -> tuple[str, str | None]:
+    """(body, raw_trailer) — the `=== TRAILER ===` block sliced off the tail. Uses the LAST
+    marker so a trailer that quotes the marker name in prose can't fool it. No marker → the
+    whole text is body and there is no trailer (the degrade path handles that)."""
+    if not text:
+        return text, None
+    idx = text.rfind(TRAILER_MARK)
+    if idx == -1:
+        return text, None
+    body = text[:idx].rstrip()
+    raw = text[idx + len(TRAILER_MARK):].strip()
+    return body, (raw or None)
+
+
+def _strip_fence(text: str) -> str:
+    """Tolerate a ```json … ``` fence around the trailer JSON — models add one habitually."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[-1] if "\n" in t else ""
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip()
+
+
+def _num01(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= v <= 1.0
+
+
+def parse_trailer(raw: str | None, round_no: int) -> dict | None:
+    """Validate a raw trailer against the contract schema; return the parsed dict or None.
+    Round 0 and round N share the required core (position + confidence in [0,1]); the optional
+    arrays are shape-checked leniently and dropped if malformed rather than failing the whole
+    trailer — the required core is the gate the retry/degrade path keys off."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(_strip_fence(raw))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    position = data.get("position")
+    if not isinstance(position, str) or not position.strip():
+        return None
+    if not _num01(data.get("confidence")):
+        return None
+    out: dict = {"position": position.strip(), "confidence": float(data["confidence"])}
+    claims = [c for c in data.get("claims", []) if isinstance(c, dict) and c.get("id")]
+    if claims:
+        out["claims"] = claims
+    if round_no > 0:
+        stances = [s for s in data.get("stances", [])
+                   if isinstance(s, dict) and s.get("on")
+                   and s.get("stance") in ("SUPPORT", "REFUTE", "UNCERTAIN")]
+        if stances:
+            out["stances"] = stances
+        concessions = [c for c in data.get("concessions", [])
+                       if isinstance(c, dict) and c.get("adopted")]
+        if concessions:
+            out["concessions"] = concessions
+    return out
+
+
+def confidence(parsed: dict | None) -> float | None:
+    """The overall confidence a parsed trailer carries — None when there is no trailer."""
+    return parsed.get("confidence") if isinstance(parsed, dict) else None
+
+
+# ── the retry schema (native flag: claude --json-schema <inline> · codex --output-schema <file>) ──
+def schema_json(round_no: int) -> str:
+    """The JSON Schema string the corrective retry attaches so its whole output is
+    shape-guaranteed. One permissive superset serves both variants (round 0 simply omits the
+    optional arrays); position + confidence are the required core."""
+    schema = {
+        "type": "object",
+        "required": ["position", "confidence"],
+        "properties": {
+            "position": {"type": "string", "maxLength": 300},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "claims": {"type": "array", "items": {"type": "object",
+                "required": ["id"],
+                "properties": {"id": {"type": "string"},
+                               "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                               "falsified_by": {"type": "string"}}}},
+            "stances": {"type": "array", "items": {"type": "object",
+                "required": ["on", "stance"],
+                "properties": {"on": {"type": "string"},
+                               "stance": {"enum": ["SUPPORT", "REFUTE", "UNCERTAIN"]},
+                               "evidence": {"type": "string"}}}},
+            "concessions": {"type": "array", "items": {"type": "object",
+                "required": ["adopted"],
+                "properties": {"adopted": {"type": "string"}, "evidence": {"type": "string"}}}},
+        },
+    }
+    return json.dumps(schema)
+
+
+@contextlib.contextmanager
+def system_prompt_file(text: str):
+    """A throwaway 0600 tmp file holding the contract, for `--append-system-prompt-file`.
+    A file (not a giant argv string) keeps the contract off `ps` and out of ARG_MAX; it is
+    deleted the moment the call returns. Empty text → no file (the no-contract path)."""
+    if not text:
+        yield None
+        return
+    fd, path = tempfile.mkstemp(prefix="council-contract-", suffix=".txt")
+    try:
+        os.write(fd, text.encode())
+        os.close(fd)
+        os.chmod(path, 0o600)
+        yield path
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)

@@ -1,0 +1,13 @@
+#!/bin/sh
+# The trailer-malformed-ONCE head: its main answer's TRAILER is broken JSON, but the corrective
+# retry (which carries --json-schema) returns a clean trailer — so the retry recovers. Block-json
+# shape (contract-pass tests run with COUNCIL_STREAM_TAPE=0). Argv is APPENDED, so a test can see
+# both the main call and the schema-flag retry in COUNCIL_STUB_ARGV.
+[ -n "$COUNCIL_STUB_ARGV" ] && printf '%s\n' "$@" >> "$COUNCIL_STUB_ARGV"
+cat > /dev/null
+for a in "$@"; do [ "$a" = "--json-schema" ] && SCHEMA=1; done
+if [ -n "$SCHEMA" ]; then
+  printf '{"result":"%s","total_cost_usd":0.001,"session_id":"stub-claude-sid"}\n' '{\"position\": \"rock\", \"confidence\": 0.7}'
+else
+  printf '{"result":"%s","total_cost_usd":0.004,"session_id":"stub-claude-sid"}\n' '=== ANSWER ===\nThe moon is rock.\n=== TRAILER ===\n{ this is not valid json'
+fi

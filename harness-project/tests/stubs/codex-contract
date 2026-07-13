@@ -1,0 +1,17 @@
+#!/bin/sh
+# Canned codex head that OBEYS the output contract. --json JSONL (exec --json) with a clean
+# trailer inside the agent_message; plain-stdout fallback for the sessionless block path.
+# Argv goes to COUNCIL_CODEX_ARGV (its OWN var — the claude stub owns COUNCIL_STUB_ARGV, and the
+# two heads run concurrently, so a shared capture file would race).
+[ -n "$COUNCIL_CODEX_ARGV" ] && printf '%s\n' "$@" > "$COUNCIL_CODEX_ARGV"
+cat > /dev/null
+ANSWER='=== POSITION ===\nThe moon is rock.\n=== ANSWER ===\nThe moon is made of rock.\n=== TRAILER ===\n{\"position\": \"rock\", \"confidence\": 0.7}'
+for a in "$@"; do [ "$a" = "--json" ] && JSON=1; done
+if [ -n "$JSON" ]; then
+  echo '{"type":"thread.started","thread_id":"stub-thread-1"}'
+  echo '{"type":"turn.started"}'
+  printf '{"type":"item.completed","item":{"id":"m0","type":"agent_message","text":"%s"}}\n' "$ANSWER"
+  echo '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":5}}'
+else
+  printf '%b\n' "$ANSWER"
+fi

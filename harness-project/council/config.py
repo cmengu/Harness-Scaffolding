@@ -46,6 +46,10 @@ class Config:
     solo_thinking_tokens: int = 0
     solo_tools: bool = False
     claude_tools: str = "Read Grep Glob WebSearch WebFetch"   # the allowlist when tools are on (no Bash in v1)
+    # The output contract (step 3): armed answers follow the section/trailer contract, injected
+    # fresh per call. On by default; only armed duels consult it (solo/unarmed never inject), so
+    # this is the "default on when armed" knob shadow mode A/B's the whole contract with.
+    contract: bool = True
     # The tape (step 5): duels stream both heads interleaved into one scroll column.
     stream_tape: bool = True         # false = the classic block-then-present duel
     tape_verbose: bool = True        # show the dim thinking/tool/retry lines (Ctrl+T / /tape flips live)
