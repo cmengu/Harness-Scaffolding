@@ -13,25 +13,25 @@ from dataclasses import dataclass
 from . import flight
 from .config import Config
 from .ledger import head_cost, record
+from .pricing import codex_rate
 
 
 def codex_usd(usage: dict, cfg: Config) -> float:
     """Price a codex turn locally: its CLI reports tokens, never dollars (probes 11 Jul),
-    so folding codex into one dollar total means multiplying token usage by list rates.
-    Rates are config knobs (codex_price_* — USD per 1M tokens, GPT-5-Codex list by default;
-    all-zero = token-only reporting). input_tokens is the whole prompt incl. cached; the
-    cached slice bills at the discounted rate. reasoning tokens are already inside
-    output_tokens (OpenAI billing), so they are not added a second time."""
-    if not isinstance(usage, dict):
+    so folding codex into one dollar total means multiplying token usage by list rates. The
+    rate comes from pricing.codex_rate(cfg.codex_model) — the per-model table — so /model
+    codex <id> re-prices automatically; cfg.codex_pricing=False disables it (token-only).
+    input_tokens is the whole prompt incl. cached; the cached slice bills at the discounted
+    rate. reasoning tokens are already inside output_tokens (OpenAI billing), not re-added."""
+    if not isinstance(usage, dict) or not cfg.codex_pricing:
         return 0.0
+    (p_in, p_cached, p_out), _model, _exact = codex_rate(cfg.codex_model)
     inp = int(usage.get("input_tokens") or 0)
     out = int(usage.get("output_tokens") or 0)
     cached = int(usage.get("cached_input_tokens") or usage.get("cached_input")
                  or (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0)
     billed_input = max(0, inp - cached)
-    return round(billed_input / 1e6 * cfg.codex_price_input
-                 + cached / 1e6 * cfg.codex_price_cached
-                 + out / 1e6 * cfg.codex_price_output, 6)
+    return round(billed_input / 1e6 * p_in + cached / 1e6 * p_cached + out / 1e6 * p_out, 6)
 
 
 def _record_codex_cost(usage: dict, cfg: Config) -> float:
