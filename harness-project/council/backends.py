@@ -45,6 +45,16 @@ def _record_codex_cost(usage: dict, cfg: Config) -> float:
     return usd
 
 
+def _record_claude_cost(payload: dict) -> None:
+    """Record a claude turn's billed cost from its `--output-format json` payload (claude reports
+    dollars direct). The twin of _record_codex_cost; shared by proposer and trailer_retry so the
+    cost-capture guard lives in one place. A missing/odd figure is simply skipped — cost capture
+    must never kill the head."""
+    usd = payload.get("total_cost_usd")
+    if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+        record(head_cost("claude", usd=float(usd)))
+
+
 def _context_beat(head: str, usage: dict | None) -> None:
     """Feed the flight panel's context meter from a call's usage block. Claude reports
     cache reads/writes SEPARATELY from input_tokens (API semantics); codex's input_tokens
@@ -178,9 +188,7 @@ def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None,
         raw = _run(argv, cfg, stdin=_head_prompt(tools) + "\n\n" + message, env=env)
     try:
         payload = json.loads(raw)
-        usd = payload.get("total_cost_usd")
-        if isinstance(usd, (int, float)) and not isinstance(usd, bool):
-            record(head_cost("claude", usd=float(usd)))
+        _record_claude_cost(payload)
         _context_beat("claude", payload.get("usage"))
         if session is not None and payload.get("session_id"):
             session.claude = str(payload["session_id"])   # authoritative id (mint OR resume)
@@ -271,9 +279,7 @@ def trailer_retry(head: str, session: HeadSessions, cfg: Config, round_no: int) 
             raw = _run(argv, cfg, stdin=_TRAILER_RETRY_MSG)
             try:
                 payload = json.loads(raw)
-                usd = payload.get("total_cost_usd")
-                if isinstance(usd, (int, float)) and not isinstance(usd, bool):
-                    record(head_cost("claude", usd=float(usd)))
+                _record_claude_cost(payload)
                 return str(payload.get("result", raw)).strip()
             except (json.JSONDecodeError, KeyError, TypeError):
                 return raw

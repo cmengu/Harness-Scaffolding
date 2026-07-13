@@ -38,14 +38,15 @@ def test_injection_round0_is_opening_shape():
     assert "SUPPORT|REFUTE|UNCERTAIN" not in t         # no stances at round 0
 
 
-def test_injection_roundN_carries_deliberation_pack_and_confidence():
-    t = contract.injection(1, opponent_confidence=0.5, final_round=True)
+def test_injection_roundN_carries_deliberation_and_pack():
+    t = contract.injection(1, final_round=True)
     assert "=== DELIBERATION ===" in t
     assert "REFUTE BY REPRODUCTION" in t               # the community prompt-line pack is woven in
-    assert "do not simply defer" in t.lower() or "not simply defer" in t.lower()
+    assert "NOT defer" in t                            # anti-deference line (how to weigh confidence)
     assert "SUPPORT|REFUTE|UNCERTAIN" in t             # stances committed in the trailer
-    assert "0.50" in t                                 # the opponent's stated confidence
-    assert contract.injection(1, opponent_confidence=None).find("stated confidence") == -1
+    # opponent confidence is a dynamic per-turn fact — it rides the MESSAGE, not this static
+    # template (see test_roundN_message_carries_opponent_confidence).
+    assert "stated confidence" not in t
 
 
 def test_injection_nonfinal_round_pins_artifact_none():
@@ -73,6 +74,13 @@ def test_validate_rejects_missing_broken_and_out_of_range():
 def test_fenced_trailer_tolerated():
     parsed = contract.parse_trailer('```json\n{"position": "x", "confidence": 0.3}\n```', 0)
     assert parsed and parsed["confidence"] == 0.3
+
+
+def test_retry_schema_has_two_variants():
+    # round 0 has no stances/concessions; round N adds them (contract spec §trailer-schema).
+    assert "stances" not in contract.schema_json(0)
+    assert "stances" in contract.schema_json(1) and "concessions" in contract.schema_json(1)
+    assert '"required": ["position", "confidence"]' in contract.schema_json(0)
 
 
 def test_config_contract_defaults_on():

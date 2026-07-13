@@ -164,11 +164,10 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
             # drifts into critiquing prose style
             msg_a = f"Question:\n{seeded}\n\nYour last answer:\n{prev_a}\n\nThe other voice said:\n{prev_b}\n{oc_a}\n{_CRIT_INSTR}"
             msg_b = f"Question:\n{seeded}\n\nYour last answer:\n{prev_b}\n\nThe other voice said:\n{prev_a}\n{oc_b}\n{_CRIT_INSTR}"
-        con_a = contract_tpl.injection(n, opponent_confidence=conf["codex"],
-                                       final_round=(n == rounds)) if cfg.contract else ""
-        con_b = contract_tpl.injection(n, opponent_confidence=conf["claude"],
-                                       final_round=(n == rounds)) if cfg.contract else ""
-        raw_a, raw_b = both(msg_a, msg_b, round_no=n, con_a=con_a, con_b=con_b)
+        # The contract template is per-round, not per-head (opponent confidence rides the
+        # message above); both heads get the same round-N injection.
+        con_n = contract_tpl.injection(n, final_round=(n == rounds)) if cfg.contract else ""
+        raw_a, raw_b = both(msg_a, msg_b, round_no=n, con_a=con_n, con_b=con_n)
         died = [h for h, t in (("claude", raw_a), ("codex", raw_b)) if preamble.is_dead(t)]
         if died:                             # mid-debate death: keep the last GOOD answers
             record(debate_event("round_failed", round=n, dead=died))
