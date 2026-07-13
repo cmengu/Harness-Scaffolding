@@ -20,7 +20,8 @@ import time
 from pathlib import Path
 
 from ..config import Config
-from ..ledger import record
+from ..ledger import (code_permission, code_session, inject_error, paste_retry,
+                      record, scrape_advisory, state_parse_error)
 from .bridge import (draft_lingering, inject, kill_session, launch_claude_in_tmux,
                      pane_alive, pane_tail, press_enter, send_keys, write_hook_settings)
 from .bridge import prepare_bridge_dir
@@ -59,7 +60,7 @@ class SessionState:
             except json.JSONDecodeError:
                 # A torn line raising here would kill the daemon thread SILENTLY and freeze
                 # .busy=True forever. Skip-and-log: markers are cumulative, the next corrects.
-                record({"role": "state_parse_error", "line": line[:200].decode(errors="replace")})
+                record(state_parse_error(line[:200].decode(errors="replace")))
                 continue
             self.busy = (m["state"] != "idle")               # last marker in the batch wins
             self.blocked = (m["state"] == "blocked")         # D2: any later marker clears it
@@ -116,7 +117,7 @@ def _deliver(bridge: Path, text: str, state: SessionState, renderer, cfg: Config
                 press_enter(bridge)
         if attempt == 0 and not advisory["draft_seen"] \
                 and not draft_lingering(bridge, advisory["needle"]):
-            record({"role": "paste_retry", "text": text[:200]})   # evidence trail, like scrape_advisory
+            record(paste_retry(text[:200]))          # evidence trail, like scrape_advisory
             renderer.notice("first paste vanished (fresh-launch wart) — re-pasting once…")
             continue
         break                                    # draft visible (or 2nd attempt): never paste again
@@ -133,19 +134,19 @@ def _inject_confirmed(bridge: Path, text: str, state: SessionState, renderer, cf
         confirmed, advisory = _deliver(bridge, text, state, renderer, cfg)
     except RuntimeError as exc:
         renderer.error(f"⚠ inject failed: {exc}")
-        record({"role": "inject_error", "text": text, "error": str(exc)})
+        record(inject_error(text, error=str(exc)))
         return
     if confirmed:
         if advisory["draft_seen"] and draft_lingering(bridge, advisory["needle"]):
-            record({"role": "scrape_advisory", "text": text,
-                    "note": "receipt confirmed but the pane still shows the draft"})
+            record(scrape_advisory(text,
+                    note="receipt confirmed but the pane still shows the draft"))
         return
     renderer.error(f"⚠ inject NOT confirmed in {cfg.submit_timeout}s — "
                    "message may not have submitted")
-    record({"role": "inject_error", "text": text, "waited_s": cfg.submit_timeout,
-            "draft_seen": advisory["draft_seen"],
-            "draft_lingering": draft_lingering(bridge, advisory["needle"]),
-            "pane_tail": pane_tail(bridge)})
+    record(inject_error(text, waited_s=cfg.submit_timeout,
+                        draft_seen=advisory["draft_seen"],
+                        draft_lingering=draft_lingering(bridge, advisory["needle"]),
+                        pane_tail=pane_tail(bridge)))
 
 
 # ── D2 answered — the permission relay ────────────────────────────────────────
@@ -176,7 +177,7 @@ def _answer_permission(bridge: Path, renderer, state: SessionState) -> str | Non
         send_keys(bridge, ans)
     except RuntimeError as exc:
         renderer.error(f"⚠ could not reach the pane: {exc}")
-    record({"role": "code_permission", "answer": ans})
+    record(code_permission(ans))
     state.blocked = False
     return None
 
@@ -272,7 +273,7 @@ def _answer_boot_dialog(bridge: Path, renderer, cfg: Config) -> None:
                 return
             with contextlib.suppress(RuntimeError):
                 send_keys(bridge, ans)
-            record({"role": "code_permission", "dialog": "trust", "answer": ans})
+            record(code_permission(ans, dialog="trust"))
             return
         if PROMPT_GLYPH in tail:             # composer is up — nothing blocking, boot on
             return
@@ -306,7 +307,7 @@ def run_claude_session(*, claude_args, use_claude_config: bool, command: str,
     save_launch_cwd(bridge, Path.cwd(), resume)
     write_hook_settings(bridge)                 # council's hooks STACK on ~/.claude's
     launch_claude_in_tmux(bridge, command=command, claude_args=tuple(claude_args), resume=resume)
-    record({"role": "code_session", "event": "start", "bridge": str(bridge)})
+    record(code_session("start", bridge=str(bridge)))
     _attached_loop(bridge, cfg, fresh=True)
 
 
@@ -314,7 +315,7 @@ def attach_claude_session(bridge: Path, cfg: Config) -> None:
     """Reconnect to a live hidden claude (after /detach, or a crashed wrapper). The
     transcript replays from byte 0 — the whole conversation repaints as history — then
     the session goes live exactly as if never left."""
-    record({"role": "code_session", "event": "attach", "bridge": str(bridge)})
+    record(code_session("attach", bridge=str(bridge)))
     _attached_loop(bridge, cfg, fresh=False)
 
 
@@ -338,10 +339,10 @@ def _attached_loop(bridge: Path, cfg: Config, *, fresh: bool) -> None:
         why = _input_pump(bridge, renderer, state, cfg)  # pump 2: council's box → the hidden pane
     finally:
         if why == "detach":
-            record({"role": "code_session", "event": "detach"})
+            record(code_session("detach"))
             renderer.console.print(f"\n[bold]⚖ detached[/] — hidden claude keeps running · "
                                    f"[dim]council attach {bridge.name}[/] to return")
         else:
             kill_session(bridge)                # never leave a hidden claude running on EXIT
-            record({"role": "code_session", "event": "end"})
+            record(code_session("end"))
             renderer.console.print("\n[bold]⚖ council code session ended[/]")
