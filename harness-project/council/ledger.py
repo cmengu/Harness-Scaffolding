@@ -73,10 +73,12 @@ permanent → the command is wrong; check the argv above against the CLI's --hel
 
 
 def save_artifact(head: str, title: str, html: str) -> "os.PathLike":
-    """Persist a duel's self-contained HTML artifact under the run (output-contract.md §artifacts):
-    `~/.council/artifacts/<run_id>/<slug>-<head>.html`. Same privacy stance as the ledger — the
-    file can hold anything a head rendered → dir 0700, file 0600. The `-<head>` suffix keeps the
-    two heads from colliding when they slugify to the same name; returns the path for the row."""
+    """Persist a duel's self-contained HTML artifact under the run AND record its ledger row —
+    the same persist-and-record shape as quarantine(). Path is
+    `~/.council/artifacts/<run_id>/<slug>-<head>.html` (output-contract.md §artifacts). Same
+    privacy stance as the ledger — the file can hold anything a head rendered → dir 0700, file
+    0600. The `-<head>` suffix keeps the two heads from colliding when they slugify to the same
+    name; returns the path so the caller can open it."""
     from pathlib import Path
     adir: Path = _cfg().ledger_path.parent / "artifacts" / RUN_ID
     adir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -89,6 +91,7 @@ def save_artifact(head: str, title: str, html: str) -> "os.PathLike":
         os.write(fd, html.encode())
     finally:
         os.close(fd)
+    record(artifact(head, path, title))
     return path
 
 

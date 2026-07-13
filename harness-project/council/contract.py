@@ -193,20 +193,18 @@ _HTML_FENCE = re.compile(r"```html\s*\n(.*?)```", re.S | re.I)
 
 
 def artifact_html(section_text: str | None) -> str | None:
-    """The self-contained HTML in an `=== ARTIFACT ===` section, or None when it is `none`
-    / absent / not HTML. Prefers a fenced ```html block; falls back to raw markup if the
-    section is bare HTML. The 'one self-contained file' rule is the contract's, enforced by
-    the template — here we just lift what the head emitted."""
+    """The self-contained HTML in an `=== ARTIFACT ===` section, or None when it is `none` /
+    absent / not a fenced block. The contract asks for exactly one fenced ```html block, so that
+    is what we lift — requiring the fence keeps prose that merely contains angle brackets from
+    being mistaken for an artifact. The one-file, self-contained, no-external-requests rules are
+    the template's; here we just extract what the head fenced."""
     if not section_text:
         return None
     s = section_text.strip()
     if not s or s.lower() == "none":
         return None
     m = _HTML_FENCE.search(s)
-    if m:
-        html = m.group(1).strip()
-        return html or None
-    return s if ("<" in s and ">" in s) else None
+    return (m.group(1).strip() or None) if m else None
 
 
 # ── the retry schema (native flag: claude --json-schema <inline> · codex --output-schema <file>) ──

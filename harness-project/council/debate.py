@@ -26,9 +26,9 @@ from .backends import (Cancelled, HeadSessions, _classify, adversary,
                        adversary_stream, kill_inflight, proposer, proposer_stream,
                        trailer_retry)
 from .config import Config
-from .ledger import (artifact as artifact_row, briefing, debate_event, debate_round,
-                     head_call, head_error, head_retry, head_session, judge as judge_row,
-                     judge_keymap, quarantine, record, save_artifact, trailer as trailer_row)
+from .ledger import (briefing, debate_event, debate_round, head_call, head_error,
+                     head_retry, head_session, judge as judge_row, judge_keymap,
+                     quarantine, record, save_artifact, trailer as trailer_row)
 from . import preamble
 
 
@@ -92,6 +92,15 @@ def _contract_pass(head, raw, round_no, sessions, cfg, console):
     return body, parsed
 
 
+def _answer_rule(console, color, g, name, round_no, conf=None) -> None:
+    """The header rule an answer commits under in the tape — shared by the contract and legacy
+    finals so the round tag and optional confidence suffix live in one place."""
+    console.rule(f"[{color}]{g} {name}[/]"
+                 + (f"  [dim]round {round_no}[/]" if round_no else "")
+                 + (f"  [dim]conf {conf:.2f}[/]" if conf is not None else ""),
+                 style=color, align="left")
+
+
 def _on_tty() -> bool:
     return sys.stdout.isatty()
 
@@ -124,8 +133,7 @@ def _emit_artifact(head, body, question, cfg, console) -> None:
     if not html:
         return
     title = (secs.get("position") or question or "artifact").splitlines()[0][:60]
-    path = save_artifact(head, title, html)
-    record(artifact_row(head, path, title))
+    path = save_artifact(head, title, html)          # persists AND records the ledger row
     console.print(f"[dim]🎨 {head} artifact → {path}[/]")
     _open_artifact(path, cfg)
 
@@ -468,10 +476,7 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
                             if ln.strip():                   # CLAIMS are literally `[id] …` — escape
                                 console.print(f"[dim]  {escape(ln)}[/]")
                         conf = contract_tpl.confidence(contract_tpl.parse_trailer(ftrailer, round_no))
-                        console.rule(f"[{color}]{g} {name}[/]"
-                                     + (f"  [dim]round {round_no}[/]" if round_no else "")
-                                     + (f"  [dim]conf {conf:.2f}[/]" if conf is not None else ""),
-                                     style=color, align="left")
+                        _answer_rule(console, color, g, name, round_no, conf)
                         console.print(fsecs["answer"])
                     else:                                # LEGACY (contract off / free-form)
                         crit, ans = _split_verdict(finals[head]) if round_no else ("", finals[head])
@@ -479,9 +484,7 @@ def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no
                             box_line(head, f"{name} challenges:")
                             box_line(head, crit)
                         close_box()                      # answers stand OUTSIDE the scratch box
-                        console.rule(f"[{color}]{g} {name}[/]"
-                                     + (f"  [dim]round {round_no}[/]" if round_no else ""),
-                                     style=color, align="left")
+                        _answer_rule(console, color, g, name, round_no)
                         console.print(ans)
                 elif kind == "error":
                     if isinstance(payload, dict) and payload.get("cancelled"):

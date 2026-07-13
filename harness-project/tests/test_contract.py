@@ -213,7 +213,8 @@ def test_artifact_html_extraction():
     assert contract.artifact_html("none") is None
     assert contract.artifact_html(None) is None
     assert contract.artifact_html("```html\n<h1>Hi</h1>\n```") == "<h1>Hi</h1>"
-    assert contract.artifact_html("<div>bare</div>") == "<div>bare</div>"
+    assert contract.artifact_html("<div>unfenced</div>") is None   # the contract requires a fence
+    assert contract.artifact_html("prose with a < b and c > d") is None
     assert contract.artifact_html("not markup at all") is None
 
 
@@ -242,6 +243,15 @@ def test_deliberation_excluded_from_report_answer_view():
 def test_deliberation_excluded_from_present_excerpt():
     console, buf = taped()
     debate._present(console, CONTRACT_BODY, CONTRACT_BODY, load_config())
+    out = buf.getvalue()
+    assert "my private working" not in out and "The moon is rock." in out
+
+
+def test_deliberation_excluded_from_single_voiced_report():
+    # the proposer-only branch (a duel that went single-voiced) is still a deliverable view
+    console, buf = taped()
+    row = {"role": "debate", "round": 0, "proposer": CONTRACT_BODY}   # no adversary
+    report.render_rows([row], console)
     out = buf.getvalue()
     assert "my private working" not in out and "The moon is rock." in out
 
