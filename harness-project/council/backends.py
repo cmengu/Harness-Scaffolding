@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from . import flight
 from .config import Config
+from .contract import schema_json, system_prompt_file
 from .ledger import head_cost, record
 from .pricing import codex_rate
 
@@ -148,7 +149,7 @@ def _classify(exc: Exception) -> str:
 
 
 def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None,
-             thinking: int = 0, tools: bool = False) -> str:
+             thinking: int = 0, tools: bool = False, contract: str = "") -> str:
     """Claude head — the REAL `claude` CLI, headless.
     Prompt goes via STDIN: `--allowedTools` is variadic and eats a trailing positional
     prompt as a tool name (live-verified vs claude 2.1.200, 4 Jul 2026).
@@ -160,16 +161,21 @@ def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None,
     ride the cache at ~5x lower cost (probes 11 Jul).
     Depth: `thinking` rides the MAX_THINKING_TOKENS env (probes 11 Jul; the text stays
     redacted headless — only the token count comes back); `tools` opens cfg.claude_tools
-    (read-only research set, no Bash) — headless -p auto-approves allowlisted tools."""
-    argv = [cfg.claude_command, "-p", "--output-format", "json",
-            "--allowedTools", cfg.claude_tools if tools else ""]
-    if session is not None:
-        argv += ["--resume", session.claude] if session.claude \
-            else ["--session-id", str(uuid.uuid4())]
-    if cfg.claude_model:
-        argv += ["--model", cfg.claude_model]        # /model claude <name> — shipped verbatim
-    env = {"MAX_THINKING_TOKENS": str(thinking)} if thinking > 0 else None
-    raw = _run(argv, cfg, stdin=_head_prompt(tools) + "\n\n" + message, env=env)
+    (read-only research set, no Bash) — headless -p auto-approves allowlisted tools.
+    `contract`: the armed output contract, injected via --append-system-prompt-file (a tmp file,
+    not argv — keeps it off `ps`); empty on solo/unarmed turns, which stay contract-free."""
+    with system_prompt_file(contract) as spf:
+        argv = [cfg.claude_command, "-p", "--output-format", "json",
+                "--allowedTools", cfg.claude_tools if tools else ""]
+        if spf:
+            argv += ["--append-system-prompt-file", spf]
+        if session is not None:
+            argv += ["--resume", session.claude] if session.claude \
+                else ["--session-id", str(uuid.uuid4())]
+        if cfg.claude_model:
+            argv += ["--model", cfg.claude_model]    # /model claude <name> — shipped verbatim
+        env = {"MAX_THINKING_TOKENS": str(thinking)} if thinking > 0 else None
+        raw = _run(argv, cfg, stdin=_head_prompt(tools) + "\n\n" + message, env=env)
     try:
         payload = json.loads(raw)
         usd = payload.get("total_cost_usd")
@@ -184,7 +190,7 @@ def proposer(message: str, cfg: Config, *, session: HeadSessions | None = None,
 
 
 def adversary(message: str, cfg: Config, *, session: HeadSessions | None = None,
-              effort: str | None = None, tools: bool = False) -> str:
+              effort: str | None = None, tools: bool = False, contract: str = "") -> str:
     """Codex head — `codex exec`, headless, read-only sandbox.
     Why codex (not an openai-agents SDK): an unpinned model silently falls back to the Databricks
     gateway; `codex exec` has no such fallback. /model·/effort ride as `-m` and
@@ -194,10 +200,13 @@ def adversary(message: str, cfg: Config, *, session: HeadSessions | None = None,
     any cwd, not just a trusted git repo (probes 11 Jul). Sessionless stays plain-stdout.
     Depth: `effort` overrides cfg.codex_effort per call (the duel arms high); `tools`
     adds live web search (`tools.web_search=true` — the `--search` flag is interactive-only;
-    file reading is already native to codex's read-only sandbox)."""
+    file reading is already native to codex's read-only sandbox).
+    `contract`: codex has no append-system-prompt flag (and writing AGENTS.md would pollute the
+    user's repo), so the armed output contract is PREPENDED to the composed message instead."""
     effort = effort or cfg.codex_effort
     depth_argv = (["-c", f"model_reasoning_effort={effort}"] if effort else []) \
         + (["-c", "tools.web_search=true"] if tools else [])
+    composed = (contract + "\n\n" if contract else "") + _head_prompt(tools) + "\n\n" + message
     if session is not None:
         if session.codex:
             argv = [cfg.codex_command, "exec", "resume", session.codex,
@@ -207,12 +216,11 @@ def adversary(message: str, cfg: Config, *, session: HeadSessions | None = None,
                     "--skip-git-repo-check"]
             if cfg.codex_model:
                 argv += ["-m", cfg.codex_model]      # model is fixed at mint; resume inherits it
-        return _codex_events(
-            _run(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg), session, cfg)
+        return _codex_events(_run(argv + depth_argv + [composed], cfg), session, cfg)
     argv = [cfg.codex_command, "exec", "--sandbox", "read-only"]
     if cfg.codex_model:
         argv += ["-m", cfg.codex_model]
-    return _run(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg)
+    return _run(argv + depth_argv + [composed], cfg)
 
 
 def _codex_events(raw: str, session: HeadSessions, cfg: Config) -> str:
@@ -238,6 +246,47 @@ def _codex_events(raw: str, session: HeadSessions, cfg: Config) -> str:
     return "\n\n".join(t for t in texts if t).strip() or raw
 
 
+_TRAILER_RETRY_MSG = (
+    "Your previous answer's === TRAILER === block was missing or did not parse. Emit ONLY the "
+    "corrected TRAILER JSON for the answer you just gave — a single JSON object, no prose, no "
+    "markers, nothing before or after it.")
+
+
+def trailer_retry(head: str, session: HeadSessions, cfg: Config, round_no: int) -> str:
+    """The one cheap corrective retry (output-contract.md §enforcement): a follow-up on the
+    SAME head session asking for trailer-only, with the native schema flag attached — since the
+    whole retry output is now the trailer, the flag applies and the reply is shape-guaranteed
+    (or errors cleanly). Resumed → cents-level. Returns the raw trailer text, or "" when there
+    is no session to resume or the call fails — a retry that itself fails just means we degrade,
+    so this must NEVER raise into the duel loop."""
+    schema = schema_json(round_no)
+    try:
+        if head == "claude":
+            if session is None or not session.claude:
+                return ""
+            argv = [cfg.claude_command, "-p", "--output-format", "json",
+                    "--resume", session.claude, "--json-schema", schema]
+            if cfg.claude_model:
+                argv += ["--model", cfg.claude_model]
+            raw = _run(argv, cfg, stdin=_TRAILER_RETRY_MSG)
+            try:
+                payload = json.loads(raw)
+                usd = payload.get("total_cost_usd")
+                if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+                    record(head_cost("claude", usd=float(usd)))
+                return str(payload.get("result", raw)).strip()
+            except (json.JSONDecodeError, KeyError, TypeError):
+                return raw
+        if session is None or not session.codex:
+            return ""
+        with system_prompt_file(schema) as spath:     # a throwaway 0600 file for --output-schema
+            argv = [cfg.codex_command, "exec", "resume", session.codex,
+                    "--json", "--skip-git-repo-check", "--output-schema", spath]
+            return _codex_events(_run(argv + [_TRAILER_RETRY_MSG], cfg), session, cfg)
+    except Exception:                                  # transport/exit failure → degrade, never die
+        return ""
+
+
 # ── the streaming pump (step 4) ─────────────────────────────────────────────────────
 # Events are the product; renderers are guests (ROADMAP). Each head grows a streaming
 # twin yielding plain dicts {head, kind, payload, ts} — JSONL-able, Rich-free — so the
@@ -249,26 +298,30 @@ def _ev(head: str, kind: str, payload) -> dict:
 
 
 def proposer_stream(message: str, cfg: Config, *, session: HeadSessions | None = None,
-                    thinking: int = 0, tools: bool = False):
+                    thinking: int = 0, tools: bool = False, contract: str = ""):
     """Streaming twin of proposer: `--output-format stream-json --include-partial-messages`
     (REQUIRES --verbose under -p — probes 11 Jul). Claude's thinking TEXT arrives redacted
     headless; the pump still forwards the empty deltas (self-healing if a release lifts the
-    redaction) and emits the authoritative token count from message_delta as the pulse."""
-    argv = [cfg.claude_command, "-p", "--output-format", "stream-json",
-            "--include-partial-messages", "--verbose",
-            "--allowedTools", cfg.claude_tools if tools else ""]
-    if session is not None:
-        argv += ["--resume", session.claude] if session.claude \
-            else ["--session-id", str(uuid.uuid4())]
-    if cfg.claude_model:
-        argv += ["--model", cfg.claude_model]
-    env = {"MAX_THINKING_TOKENS": str(thinking)} if thinking > 0 else None
-    for line in _run_lines(argv, cfg, stdin=_head_prompt(tools) + "\n\n" + message, env=env):
-        try:
-            e = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        yield from _claude_events(e, session)
+    redaction) and emits the authoritative token count from message_delta as the pulse.
+    `contract`: same --append-system-prompt-file injection as the block twin."""
+    with system_prompt_file(contract) as spf:
+        argv = [cfg.claude_command, "-p", "--output-format", "stream-json",
+                "--include-partial-messages", "--verbose",
+                "--allowedTools", cfg.claude_tools if tools else ""]
+        if spf:
+            argv += ["--append-system-prompt-file", spf]
+        if session is not None:
+            argv += ["--resume", session.claude] if session.claude \
+                else ["--session-id", str(uuid.uuid4())]
+        if cfg.claude_model:
+            argv += ["--model", cfg.claude_model]
+        env = {"MAX_THINKING_TOKENS": str(thinking)} if thinking > 0 else None
+        for line in _run_lines(argv, cfg, stdin=_head_prompt(tools) + "\n\n" + message, env=env):
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            yield from _claude_events(e, session)
 
 
 def _claude_events(e: dict, session: HeadSessions | None):
@@ -304,14 +357,16 @@ def _claude_events(e: dict, session: HeadSessions | None):
 
 
 def adversary_stream(message: str, cfg: Config, *, session: HeadSessions | None = None,
-                     effort: str | None = None, tools: bool = False):
+                     effort: str | None = None, tools: bool = False, contract: str = ""):
     """Streaming twin of adversary: `exec --json` is already line-events on stdout.
     `model_reasoning_summary=detailed` makes codex's reasoning arrive as READABLE text
-    items (probes 11 Jul) — the glass box's counterweight to claude's redacted thinking."""
+    items (probes 11 Jul) — the glass box's counterweight to claude's redacted thinking.
+    `contract`: prepended to the composed message, same as the block twin."""
     effort = effort or cfg.codex_effort
     depth_argv = (["-c", f"model_reasoning_effort={effort}"] if effort else []) \
         + (["-c", "tools.web_search=true"] if tools else []) \
         + (["-c", "model_reasoning_summary=detailed"])
+    composed = (contract + "\n\n" if contract else "") + _head_prompt(tools) + "\n\n" + message
     if session is not None and session.codex:
         argv = [cfg.codex_command, "exec", "resume", session.codex,
                 "--json", "--skip-git-repo-check"]
@@ -321,7 +376,7 @@ def adversary_stream(message: str, cfg: Config, *, session: HeadSessions | None 
         if cfg.codex_model:
             argv += ["-m", cfg.codex_model]
     plain, saw_final = [], False
-    for line in _run_lines(argv + depth_argv + [_head_prompt(tools) + "\n\n" + message], cfg):
+    for line in _run_lines(argv + depth_argv + [composed], cfg):
         try:
             e = json.loads(line)
         except json.JSONDecodeError:

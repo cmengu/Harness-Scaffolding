@@ -1,0 +1,7 @@
+#!/bin/sh
+# The trailer-malformed-TWICE head: its TRAILER is broken JSON on the main answer AND on the
+# schema-flag retry (a head that simply cannot comply). Council must degrade: keep the prose,
+# store the trailer raw, mark the row unparsed. Block-json shape.
+[ -n "$COUNCIL_STUB_ARGV" ] && printf '%s\n' "$@" >> "$COUNCIL_STUB_ARGV"
+cat > /dev/null
+printf '{"result":"%s","total_cost_usd":0.004,"session_id":"stub-claude-sid"}\n' '=== ANSWER ===\nThe moon is rock.\n=== TRAILER ===\n{ still not valid json'

@@ -6,8 +6,17 @@
 #   COUNCIL_STUB_ARGV    = file to receive the argv line
 #   COUNCIL_STUB_ENV     = file to receive MAX_THINKING_TOKENS
 #   COUNCIL_STUB_TEXT    = override the canned answer text (step-6 marker tests)
+#   COUNCIL_STUB_SYSPROMPT = file the --append-system-prompt-file CONTENT is APPENDED to
+#                            (contract injection tests read it back — real claude reads that file)
 # session_id mirrors the real CLI's result payload (probes 11 Jul).
 [ -n "$COUNCIL_STUB_ARGV" ] && printf '%s ' "$@" > "$COUNCIL_STUB_ARGV"
+if [ -n "$COUNCIL_STUB_SYSPROMPT" ]; then
+  prev=""
+  for a in "$@"; do
+    [ "$prev" = "--append-system-prompt-file" ] && [ -f "$a" ] && cat "$a" >> "$COUNCIL_STUB_SYSPROMPT"
+    prev="$a"
+  done
+fi
 if [ -n "$COUNCIL_STUB_CAPTURE" ]; then cat > "$COUNCIL_STUB_CAPTURE"; else cat > /dev/null; fi
 [ -n "$COUNCIL_STUB_ENV" ] && echo "MAX_THINKING_TOKENS=$MAX_THINKING_TOKENS" > "$COUNCIL_STUB_ENV"
 TEXT="${COUNCIL_STUB_TEXT:-STUB CLAUDE: the moon is made of rock}"

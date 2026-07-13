@@ -26,6 +26,11 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "CONFIG_TOML", tmp_path / "config.toml")
     # Retry backoff in milliseconds, not seconds — tests exercise the loop, not the clock.
     monkeypatch.setenv("COUNCIL_RETRY_BASE_DELAY", "0.01")
+    # The output contract is default-ON in production (Config.contract=True), but the pre-contract
+    # suite is the baseline: existing duel tests assert free-form answers and exact call counts,
+    # which trailer injection/slicing would perturb. So contract is OFF by default under test and
+    # the contract tests (test_contract.py) opt IN explicitly with COUNCIL_CONTRACT=1.
+    monkeypatch.setenv("COUNCIL_CONTRACT", "0")
     ledger._cfg.cache_clear()
     yield
     ledger._cfg.cache_clear()

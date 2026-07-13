@@ -111,7 +111,7 @@ def test_half_minted_pair_reseeds_only_the_dead_head(monkeypatch):
     calls = []
 
     def fake_both(msg_a, msg_b, cfg, console, sessions=None, depth=None,
-                  round_no=0, live=True):
+                  round_no=0, live=True, con_a="", con_b=""):
         calls.append((msg_a, msg_b))
         return "A-ans", "B-ans"
 
