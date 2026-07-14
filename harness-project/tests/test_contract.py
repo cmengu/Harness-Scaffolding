@@ -285,3 +285,76 @@ def test_artifact_open_offswitch_suppresses_open(monkeypatch):
     rows = trace(role="artifact")
     assert len(rows) == 1 and Path(rows[0]["path"]).exists()  # file + row still land
     assert launched == []                                     # …but nothing opened
+
+
+# ── #9: trailer mechanics trio — position similarity, round-0 router, early-stop, syco flag ──
+def test_position_similarity_metric():
+    assert contract.position_similarity("rock", "rock") == 1.0
+    assert contract.position_similarity("The moon is rock.", "moon is  ROCK") > 0.75   # normalized
+    assert contract.position_similarity("rock", "cheese") < 0.5
+    assert contract.position_similarity("", "rock") == 0.0                              # empty guard
+    assert contract.position_similarity("rock", "") == 0.0
+
+
+def test_position_similarity_and_evidenced_stance():
+    assert contract.positions_agree("rock", "rock")
+    assert contract.positions_agree("The moon is rock.", "moon is  ROCK")   # normalized match
+    assert not contract.positions_agree("rock", "cheese")
+    assert not contract.positions_agree("rock", "")                         # empty never agrees
+    assert contract.has_evidenced_stance({"stances": [{"stance": "REFUTE", "evidence": "the data"}]})
+    assert not contract.has_evidenced_stance({"stances": [{"stance": "REFUTE"}]})   # no evidence
+    assert not contract.has_evidenced_stance({"stances": []})
+
+
+def _seq(monkeypatch, tmp_path, claude_seq, codex_seq):
+    monkeypatch.setenv("COUNCIL_CLAUDE_COMMAND", str(STUBS / "claude-contract-seq"))
+    monkeypatch.setenv("COUNCIL_CODEX_COMMAND", str(STUBS / "codex-contract-seq"))
+    monkeypatch.setenv("COUNCIL_STUB_SEQ", claude_seq)
+    monkeypatch.setenv("COUNCIL_CODEX_SEQ", codex_seq)
+    monkeypatch.setenv("COUNCIL_STUB_COUNT", str(tmp_path / "cc"))
+    monkeypatch.setenv("COUNCIL_CODEX_COUNT", str(tmp_path / "xc"))
+
+
+def test_round0_agreement_skips_critique_round(tmp_path, monkeypatch):
+    armed(monkeypatch, COUNCIL_STREAM_TAPE="0")
+    _seq(monkeypatch, tmp_path, "rock", "rock")                 # both open on the same position
+    debate.run("q", rounds=1, judge=None, cfg=load_config(), console=quiet(), sessions=HeadSessions())
+    assert len(trace(role="round0_agreed")) == 1
+    assert len(trace(role="head_call")) == 2                    # round 0 only — critique skipped
+    assert [r for r in trace(role="debate") if r.get("round") == 1] == []
+
+
+def test_cross_head_convergence_stops_early(tmp_path, monkeypatch):
+    armed(monkeypatch, COUNCIL_STREAM_TAPE="0")
+    _seq(monkeypatch, tmp_path, "rock:rock", "cheese:rock")     # disagree at 0, codex moves to rock at 1
+    debate.run("q", rounds=3, judge=None, cfg=load_config(), console=quiet(), sessions=HeadSessions())
+    assert trace(role="round0_agreed") == []                   # did NOT short-circuit at round 0
+    conv = [r for r in trace(role="debate") if r.get("event") == "converged"]
+    assert len(conv) == 1 and conv[0]["round"] == 1 and conv[0]["cross_head"] is True
+    assert [r for r in trace(role="debate") if r.get("round") == 2] == []   # stopped before round 2
+    assert trace(role="unresolved") == []
+
+
+def test_deadlock_records_unresolved_at_cap(tmp_path, monkeypatch):
+    armed(monkeypatch, COUNCIL_STREAM_TAPE="0")
+    _seq(monkeypatch, tmp_path, "rock", "cheese")              # never agree, near-static prose
+    debate.run("q", rounds=2, judge=None, cfg=load_config(), console=quiet(), sessions=HeadSessions())
+    u = trace(role="unresolved")
+    assert len(u) == 1 and u[0]["round"] == 2
+    assert len(trace(role="head_call")) == 6                   # ran the full cap: 0 + 2 rounds × 2 heads
+    # the churn heuristic must NOT fake-converge a low-churn deadlock (the A4 fix)
+    assert [r for r in trace(role="debate") if r.get("event") == "converged"] == []
+
+
+def test_evidence_free_cave_flags_and_surfaces_in_report(tmp_path, monkeypatch):
+    armed(monkeypatch, COUNCIL_STREAM_TAPE="0")
+    _seq(monkeypatch, tmp_path, "rock:cheese", "cheese")       # claude caves to codex, no evidence
+    debate.run("q", rounds=1, judge=None, cfg=load_config(), console=quiet(), sessions=HeadSessions())
+    flags = trace(role="syco_flag")
+    assert len(flags) == 1 and flags[0]["head"] == "claude" and flags[0]["round"] == 1
+    console, buf = taped()                                     # surfaced in /report replay…
+    report.render_rows(trace(), console)
+    assert "syco_flag" in buf.getvalue()
+    console2, buf2 = taped()                                   # …and headlined in the summary
+    console2.print(report.summary(days=7))
+    assert "sycophancy" in buf2.getvalue()

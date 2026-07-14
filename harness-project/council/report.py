@@ -13,7 +13,8 @@ from rich.text import Text
 from .ledger import (cost_usd, is_answer, is_any_user, is_cancelled,
                      is_code_assistant, is_code_context, is_code_session,
                      is_code_tool, is_head_call, is_head_error, is_head_retry,
-                     is_judge, is_quarantined, is_run_start, is_shadow_arm, trace)
+                     is_judge, is_quarantined, is_round0_agreed, is_run_start,
+                     is_shadow_arm, is_syco_flag, is_unresolved, trace)
 
 
 def summary(days: int = 7):
@@ -43,6 +44,9 @@ def summary(days: int = 7):
     if lat:
         top.add_row("latency", f"median {_pct(lat, 50):.1f}s · p95 {_pct(lat, 95):.1f}s · worst {lat[-1]:.1f}s")
     top.add_row("cost", f"${ask_usd + code_usd:.2f}  (ask ${ask_usd:.2f} · code ${code_usd:.2f})")
+    sycos = sum(1 for r in rows if is_syco_flag(r))
+    if sycos:                                        # capitulation is worth a headline, not a scroll
+        top.add_row("sycophancy", f"{sycos} flag(s) — a head moved without evidence")
 
     per = Table(padding=(0, 2))
     for col in ("run", "started", "mode", "turns", "cost", "errors"):
@@ -100,6 +104,15 @@ def render_rows(rows: list[dict], console: Console) -> None:
             console.print(f"[red]✗ {r.get('head')}: {str(r.get('error'))[:200]}[/]")
         elif is_quarantined(r):
             console.print(f"[red]☠ postmortem → {r.get('path')}[/]")
+        elif is_round0_agreed(r):
+            console.print(f"[dim]✓ heads agreed at round 0 — critique skipped[/]"
+                          + (f" [dim]({r.get('position')})[/]" if r.get("position") else ""))
+        elif is_unresolved(r):
+            console.print(f"[yellow]⚠ unresolved — heads still disagreed at the round "
+                          f"{r.get('round')} cap[/]")
+        elif is_syco_flag(r):
+            console.print(f"[red]⚠ syco_flag[/] — {r.get('head')} moved toward its opponent "
+                          f"without evidence (round {r.get('round')})")
         elif is_shadow_arm(r):
             ovr = r.get("overrides") or []
             console.print(f"\n[bold]## arm {r.get('arm')}[/]"
