@@ -2,7 +2,6 @@
 last good answers, timeouts speak human, huge pastes stay cheap to render."""
 from __future__ import annotations
 
-import io
 import subprocess
 
 from rich.console import Console
@@ -14,9 +13,6 @@ from council.ledger import trace
 from conftest import STUBS
 
 
-def taped():
-    buf = io.StringIO()
-    return Console(file=buf, width=100), buf
 
 
 def test_dead_round_zero_aborts_debate(monkeypatch):

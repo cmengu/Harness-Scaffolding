@@ -360,6 +360,7 @@ class TapeRenderer:
     def round_start(self, round_no: int) -> None:
         self.round_no = round_no
         self.phase = {"claude": "working", "codex": "working"}
+        self.spent = {"claude": "", "codex": ""}   # per-round, like the old fan-out's call-local dict
         self.done = set()
         self.t0 = time.monotonic()
         if round_no:            # critique rounds open with an honestly-labelled rule
@@ -730,6 +731,13 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
         # sessions already hold it; reseeding would double the memory.
         s = self.sessions
         return s is None or (s.claude is None and s.codex is None)
+
+    def needs_briefing(self) -> bool:
+        """Whether a fresh briefing applies this turn: an armed duel with head-session memory
+        whose sessions haven't been briefed yet. The REPL's briefing popup asks this instead of
+        reaching into private state — the renderer owns the answer."""
+        return bool(self.adversarial and self.cfg.head_sessions
+                    and (self.sessions is None or self._fresh()))
 
     def handle(self, user_input: str) -> None:
         user_input = preamble.notes() + user_input          # /note facts ride EVERY next message

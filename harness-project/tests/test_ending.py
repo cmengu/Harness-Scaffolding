@@ -2,7 +2,6 @@
 round; critique = dim scratch work, only the standalone answer is the deliverable."""
 from __future__ import annotations
 
-import io
 
 from rich.console import Console
 
@@ -11,9 +10,6 @@ from council.config import load_config
 from council.ledger import trace
 
 
-def taped():
-    buf = io.StringIO()
-    return Console(file=buf, width=100), buf
 
 
 def test_split_verdict_contract():

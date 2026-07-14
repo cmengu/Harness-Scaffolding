@@ -836,10 +836,9 @@ def prepare_briefing(renderer, question: str, console: Console) -> None:
     from .backends import proposer
     from .debate import _safe
     from .ledger import briefing
-    cfg = getattr(renderer, "cfg", None)
-    if not (hasattr(renderer, "briefing_seed") and getattr(renderer, "adversarial", False)
-            and cfg and cfg.head_sessions and (renderer.sessions is None or renderer._fresh())):
-        return
+    if not (hasattr(renderer, "needs_briefing") and renderer.needs_briefing()):
+        return                                       # non-duel renderer, solo mode, or already briefed
+    cfg = renderer.cfg
     pre = preamble.preamble(cfg)
     if not pre:
         return
