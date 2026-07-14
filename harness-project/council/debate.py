@@ -145,6 +145,12 @@ def _heads_agree(ta, tb) -> bool:
     return contract_tpl.positions_agree(contract_tpl.position_of(ta), contract_tpl.position_of(tb))
 
 
+def _positions(ta, tb) -> dict:
+    """This round's committed positions per head — the prior round's copy feeds the capitulation
+    check (did a head move toward its opponent?)."""
+    return {"claude": contract_tpl.position_of(ta), "codex": contract_tpl.position_of(tb)}
+
+
 def _capitulated(pos_now: str, pos_prev: str, opp_prev: str, parsed) -> bool:
     """Capitulation (docs/debate-techniques A6): a head's new position sits closer to its
     opponent's PREVIOUS position than to its own previous one — it moved toward the opponent —
@@ -219,9 +225,12 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     agreed0 = cfg.contract and _heads_agree(ta, tb)
     if agreed0:
         record(round0_agreed(position=contract_tpl.position_of(ta)))
-        console.print(f"[dim]✓ both heads opened in agreement — critique round skipped[/]")
-    prev_pos = {"claude": contract_tpl.position_of(ta), "codex": contract_tpl.position_of(tb)}
-    for n in (range(1, rounds + 1) if not agreed0 else range(0)):
+        console.print("[dim]✓ both heads opened in agreement — critique round skipped[/]")
+    prev_pos = _positions(ta, tb)
+    # No critique rounds when the router fired. The for-else below still runs on the empty loop,
+    # but its `not agreed0` guard keeps an agreed duel from recording a phantom disagreement.
+    critique_rounds = range(1, rounds + 1) if not agreed0 else ()
+    for n in critique_rounds:
         prev_a, prev_b = a, b
         # One combined critique-and-final call per head per round (decision 11 Jul: 2 calls
         # per head at default rounds=1). The reply carries scratch critique + ===ANSWER===
@@ -265,20 +274,19 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         record(debate_round(n, a, b, proposer_critique=crit_a or None,
                             adversary_critique=crit_b or None))
         # CROSS-HEAD EARLY-STOP (A4): under the contract, stop on genuine cross-head AGREEMENT —
-        # char-churn can't tell "both stood firm apart" from "both converged". No contract → the
-        # classic self-churn fallback (no positions to compare).
-        if cfg.contract:
-            stop, cross = _heads_agree(ta, tb), True
-        else:
-            stop, cross = (_moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10), False
+        # char-churn can't tell "both stood firm apart" from "both converged", so it is only the
+        # no-contract fallback (no positions to compare). `agreed` also drives the cap check below.
+        agreed = _heads_agree(ta, tb) if cfg.contract else False
+        stop = agreed if cfg.contract else (_moved(prev_a, a) < 0.10 and _moved(prev_b, b) < 0.10)
         if stop:
-            record(debate_event("converged", round=n, cross_head=cross))
+            record(debate_event("converged", round=n, cross_head=cfg.contract))
             break
-        prev_pos = {"claude": contract_tpl.position_of(ta), "codex": contract_tpl.position_of(tb)}
+        prev_pos = _positions(ta, tb)
     else:
         # the loop hit the rounds cap without converging: an honest, recorded disagreement so
         # fake closure never masks a live one (a /judge or gate can escalate on it later).
-        if not agreed0 and rounds >= 1 and cfg.contract and not _heads_agree(ta, tb):
+        # (Short-circuits before `agreed` on the empty-loop paths, where it is unset.)
+        if not agreed0 and rounds >= 1 and cfg.contract and not agreed:
             record(unresolved(round=rounds))
     if cfg.contract:                     # final round only: save + open any self-contained artifact
         _emit_artifact("claude", a, question, cfg, console)

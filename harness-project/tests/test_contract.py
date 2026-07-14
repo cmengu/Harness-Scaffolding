@@ -288,6 +288,14 @@ def test_artifact_open_offswitch_suppresses_open(monkeypatch):
 
 
 # ── #9: trailer mechanics trio — position similarity, round-0 router, early-stop, syco flag ──
+def test_position_similarity_metric():
+    assert contract.position_similarity("rock", "rock") == 1.0
+    assert contract.position_similarity("The moon is rock.", "moon is  ROCK") > 0.75   # normalized
+    assert contract.position_similarity("rock", "cheese") < 0.5
+    assert contract.position_similarity("", "rock") == 0.0                              # empty guard
+    assert contract.position_similarity("rock", "") == 0.0
+
+
 def test_position_similarity_and_evidenced_stance():
     assert contract.positions_agree("rock", "rock")
     assert contract.positions_agree("The moon is rock.", "moon is  ROCK")   # normalized match
