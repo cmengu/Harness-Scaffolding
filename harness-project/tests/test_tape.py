@@ -32,15 +32,15 @@ def test_default_duel_streams_and_renders_the_tape(monkeypatch):
     assert {r["round"] for r in rows} == {0, 1}          # ledger rows unchanged by the tape
 
 
-def test_stream_tape_off_restores_block_path(tmp_path, monkeypatch):
-    argv = tmp_path / "argv"
-    monkeypatch.setenv("COUNCIL_STUB_ARGV", str(argv))
+def test_stream_tape_off_restores_block_path(monkeypatch):
+    # stream_tape off = the QuietRenderer (no live tape) + present-at-end, via the SAME fan-out.
     monkeypatch.setenv("COUNCIL_STREAM_TAPE", "false")
     console, buf = taped()
     result = debate.run("moon?", rounds=0, judge=None, cfg=load_config(), console=console)
-    assert "stream-json" not in argv.read_text()
     assert "STUB CLAUDE" in result.proposer_final
-    assert "Claude" in buf.getvalue()                    # _present still presents
+    out = buf.getvalue()
+    assert "Claude" in out                               # _present still presents the columns…
+    assert "╭" not in out                                # …but no live tape box was streamed
 
 
 def test_glyphs_are_theme_configurable(monkeypatch):
@@ -60,3 +60,14 @@ def test_dead_head_on_the_tape_degrades_single_voiced(monkeypatch):
     assert "STUB CLAUDE" in result.proposer_final
     assert "unavailable" in result.adversary_final       # _safe's contract holds on the tape
     assert "unavailable" in buf.getvalue()               # …and the user saw it happen
+
+
+def test_tape_paints_the_critique_split(monkeypatch):
+    # renderer concern: a ===ANSWER===-split reply shows the dim critique label + the clean answer.
+    monkeypatch.setenv("COUNCIL_STUB_TEXT", "your sources are stale ===ANSWER=== The moon is basalt.")
+    console, buf = taped()
+    debate.run("moon?", rounds=1, judge=None, cfg=load_config(), console=console)
+    out = buf.getvalue()
+    assert "challenges:" in out                          # honest dim label on the tape
+    assert "your sources are stale" in out               # the scratch work was shown…
+    assert "The moon is basalt." in out                  # …and the clean answer committed

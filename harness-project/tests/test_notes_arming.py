@@ -69,7 +69,7 @@ def test_briefing_popup_accept_default(monkeypatch):
     start_session()
     record({"role": "user", "text": "we discussed the moon"})
     record({"role": "debate", "round": 0, "proposer": "it is rock", "adversary": None})
-    r.prepare_briefing("now duel this")
+    chat.prepare_briefing(r, "now duel this", r.console)
     assert r.briefing_seed and r.briefing_seed.startswith("Briefing on the conversation")
     assert trace(role="briefing")[0]["choice"] == ""
 
@@ -91,7 +91,7 @@ def test_briefing_skipped_on_empty_chat():
     cfg = load_config()
     r = debate.DebateRenderer(cfg, quiet(), adversarial=True)
     start_session()
-    r.prepare_briefing("first ever question")
+    chat.prepare_briefing(r, "first ever question", r.console)
     assert r.briefing_seed is None                      # nothing to brief — no popup
 
 
@@ -102,5 +102,5 @@ def test_briefing_full_transcript_choice(monkeypatch):
     start_session()
     record({"role": "user", "text": "alpha question"})
     record({"role": "debate", "round": 0, "proposer": "alpha answer", "adversary": None})
-    r.prepare_briefing("duel it")
+    chat.prepare_briefing(r, "duel it", r.console)
     assert "Full transcript" in r.briefing_seed and "alpha answer" in r.briefing_seed

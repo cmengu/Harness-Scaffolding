@@ -11,7 +11,6 @@ import sys
 import threading
 import time
 from contextlib import nullcontext
-from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import partial
 
@@ -70,7 +69,7 @@ def _split_verdict(text: str) -> tuple[str, str]:
     return "", text.strip()
 
 
-def _contract_pass(head, raw, round_no, sessions, cfg, console):
+def _contract_pass(head, raw, round_no, sessions, cfg, renderer):
     """The output contract's in-round machinery: slice the `=== TRAILER ===` block off a head's
     answer, validate it against the schema, and on failure fire ONE corrective retry on the same
     session (native schema flag attached). Still failing → degrade, never die: keep the prose,
@@ -89,7 +88,7 @@ def _contract_pass(head, raw, round_no, sessions, cfg, console):
         record(trailer_row(head, round_no, parsed=parsed))
     else:
         record(trailer_row(head, round_no, raw=raw_trailer or raw))
-        console.print(f"[dim]⚠ {head} trailer unparsed — prose kept, stance features skip[/]")
+        renderer.notice(f"[dim]⚠ {head} trailer unparsed — prose kept, stance features skip[/]")
     return body, parsed
 
 
@@ -122,7 +121,7 @@ def _open_artifact(path, cfg) -> None:
         _launch(path)
 
 
-def _emit_artifact(head, body, question, cfg, console) -> None:
+def _emit_artifact(head, body, question, cfg, renderer) -> None:
     """Final-round only (output-contract.md §artifacts): if a head's ANSWER carries a
     self-contained HTML artifact, save it under the run (0700/0600), record the ledger row
     (path, title, head), and auto-open it on a TTY behind the artifact_open off-switch. A dead
@@ -135,7 +134,7 @@ def _emit_artifact(head, body, question, cfg, console) -> None:
         return
     title = (secs.get("position") or question or "artifact").splitlines()[0][:60]
     path = save_artifact(head, title, html)          # persists AND records the ledger row
-    console.print(f"[dim]🎨 {head} artifact → {path}[/]")
+    renderer.notice(f"[dim]🎨 {head} artifact → {path}[/]")
     _open_artifact(path, cfg)
 
 
@@ -178,7 +177,7 @@ def _duel_depth(cfg: Config) -> dict:
 
 def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | None = None,
         sessions: HeadSessions | None = None, seed: str = "",
-        depth: dict | None = None, live: bool = True) -> DebateResult:
+        depth: dict | None = None, live: bool = True, renderer=None) -> DebateResult:
     """Fan to both heads, cross-critique up to N rounds (early-stop on no movement), present, maybe judge.
     `judge`: falsy=off · 'moderator'=neutral merge · 'reasoning'=verdict, may escalate. (bool True → 'moderator'.)
     `sessions` = native head memory (11 Jul): rounds ≥1 send ONLY the other voice's answer —
@@ -193,8 +192,12 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     if judge is True:
         judge = "moderator"
     depth = depth or _duel_depth(cfg)                                   # a debate defaults to armed depth
-    both = partial(_stream_both if cfg.stream_tape else _both,
-                   cfg=cfg, console=console, sessions=sessions, depth=depth, live=live)
+    # Renderers are guests: the engine emits events, a renderer paints. Tape when armed for the
+    # terminal; a Quiet renderer (records events, paints nothing) for tests, block mode, and
+    # shadow arms — where run() presents at the end instead of streaming.
+    renderer = renderer or (TapeRenderer(cfg, console, live) if cfg.stream_tape
+                            else QuietRenderer(console))
+    fan = partial(_run_round, cfg=cfg, sessions=sessions, depth=depth, renderer=renderer)
     seeded = seed + question
     if sessions is not None:
         q_a = (seed if sessions.claude is None else "") + question
@@ -202,30 +205,31 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     else:
         q_a = q_b = seeded
     con0 = contract_tpl.injection(0) if cfg.contract else ""            # round-0 contract, both heads
-    a, b = both(q_a, q_b, round_no=0, con_a=con0, con_b=con0)           # round 0 (ANSWER mode)
+    renderer.round_start(0)
+    a, b = fan(q_a, q_b, con_a=con0, con_b=con0)                        # round 0 (ANSWER mode)
     conf = {"claude": None, "codex": None}                             # opponent confidence carry
     ta = tb = None                                                     # round trailers (mechanics)
     if cfg.contract:
-        a, ta = _contract_pass("claude", a, 0, sessions, cfg, console)
-        b, tb = _contract_pass("codex", b, 0, sessions, cfg, console)
+        a, ta = _contract_pass("claude", a, 0, sessions, cfg, renderer)
+        b, tb = _contract_pass("codex", b, 0, sessions, cfg, renderer)
         conf = {"claude": contract_tpl.confidence(ta), "codex": contract_tpl.confidence(tb)}
     record(debate_round(0, a, b))
     dead = [h for h, t in (("claude", a), ("codex", b)) if preamble.is_dead(t)]
     if dead:                                # a dead round 0 ends the debate — critiquing a
         record(debate_event("round0_failed", dead=dead))                     # corpse is noise
         if len(dead) == 2:
-            console.print("[red]✗ both heads failed — turn abandoned (nothing was answered)[/]")
+            renderer.notice("[red]✗ both heads failed — turn abandoned (nothing was answered)[/]")
         else:
             hint = (" (session cleared — it will be re-briefed next turn)"
                     if sessions is not None and getattr(sessions, dead[0]) is None else "")
-            console.print(f"[yellow]⚠ {dead[0]} failed — single-voiced answer, no debate{hint}[/]")
+            renderer.notice(f"[yellow]⚠ {dead[0]} failed — single-voiced answer, no debate{hint}[/]")
         return DebateResult(proposer_final=a, adversary_final=b, escalated=len(dead) == 2)
     # ROUND-0 AGREEMENT ROUTER (docs/debate-techniques A3): both openings already state the same
     # position → skip the critique round entirely. An easy armed turn costs 2 head calls, not 4.
     agreed0 = cfg.contract and _heads_agree(ta, tb)
     if agreed0:
         record(round0_agreed(position=contract_tpl.position_of(ta)))
-        console.print("[dim]✓ both heads opened in agreement — critique round skipped[/]")
+        renderer.notice("[dim]✓ both heads opened in agreement — critique round skipped[/]")
     prev_pos = _positions(ta, tb)
     # No critique rounds when the router fired. The for-else below still runs on the empty loop,
     # but its `not agreed0` guard keeps an agreed duel from recording a phantom disagreement.
@@ -249,24 +253,25 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         # The contract template is per-round, not per-head (opponent confidence rides the
         # message above); both heads get the same round-N injection.
         con_n = contract_tpl.injection(n, final_round=(n == rounds)) if cfg.contract else ""
-        raw_a, raw_b = both(msg_a, msg_b, round_no=n, con_a=con_n, con_b=con_n)
+        renderer.round_start(n)
+        raw_a, raw_b = fan(msg_a, msg_b, con_a=con_n, con_b=con_n)
         died = [h for h, t in (("claude", raw_a), ("codex", raw_b)) if preamble.is_dead(t)]
         if died:                             # mid-debate death: keep the last GOOD answers
             record(debate_event("round_failed", round=n, dead=died))
-            console.print(f"[yellow]⚠ {' and '.join(died)} failed in round {n} — "
-                          "keeping the previous round's answers[/]")
+            renderer.notice(f"[yellow]⚠ {' and '.join(died)} failed in round {n} — "
+                            "keeping the previous round's answers[/]")
             a, b = prev_a, prev_b
             break
         if cfg.contract:                     # strip + validate trailers BEFORE splitting prose
-            raw_a, ta = _contract_pass("claude", raw_a, n, sessions, cfg, console)
-            raw_b, tb = _contract_pass("codex", raw_b, n, sessions, cfg, console)
+            raw_a, ta = _contract_pass("claude", raw_a, n, sessions, cfg, renderer)
+            raw_b, tb = _contract_pass("codex", raw_b, n, sessions, cfg, renderer)
             conf = {"claude": contract_tpl.confidence(ta), "codex": contract_tpl.confidence(tb)}
             # CAPITULATION FLAG (A6): a head that moved toward its opponent with no evidenced stance.
             for h, parsed in (("claude", ta), ("codex", tb)):
                 opp = "codex" if h == "claude" else "claude"
                 if _capitulated(contract_tpl.position_of(parsed), prev_pos[h], prev_pos[opp], parsed):
                     record(syco_flag(h, n))
-                    console.print(f"[dim]⚠ {h} moved toward its opponent without evidence (syco_flag)[/]")
+                    renderer.notice(f"[dim]⚠ {h} moved toward its opponent without evidence (syco_flag)[/]")
         crit_a, a = _split_verdict(raw_a)
         crit_b, b = _split_verdict(raw_b)
         # the deliverable (proposer/adversary) stays clean; the scratch critiques survive
@@ -289,8 +294,8 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
         if not agreed0 and rounds >= 1 and cfg.contract and not agreed:
             record(unresolved(round=rounds))
     if cfg.contract:                     # final round only: save + open any self-contained artifact
-        _emit_artifact("claude", a, question, cfg, console)
-        _emit_artifact("codex", b, question, cfg, console)
+        _emit_artifact("claude", a, question, cfg, renderer)
+        _emit_artifact("codex", b, question, cfg, renderer)
     if not cfg.stream_tape:
         _present(console, a, b, cfg)                     # the tape already showed everything live
     result = DebateResult(proposer_final=a, adversary_final=b)
@@ -299,47 +304,251 @@ def run(question: str, *, rounds: int, judge, cfg: Config, console: Console | No
     return result
 
 
-def _both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0, live=True,
-          con_a="", con_b=""):
-    """Both heads concurrently with a live per-head status (block-then-present; columns can't
-    stream-interleave). The classic path (stream_tape=false); round_no is the tape's cue and
-    is ignored here. `con_a`/`con_b` = the per-head output contract injected on this call (empty
-    when contract is off). ^C here lands in the MAIN thread (this spinner loop) while the heads
-    run in workers — kill the subprocesses FIRST (their communicate() unblocks, each worker
-    finishes via _safe's Cancelled branch), THEN re-raise; otherwise pool.__exit__ blocks
-    forever waiting on workers stuck in communicate()."""
+class QuietRenderer:
+    """Records the engine's event stream and paints nothing — the TEST subscriber (assert events,
+    not printed text) and the block/shadow path (present-at-end, no live tape). Its `events` list
+    is the whole duel: `round_start` markers plus every {head, kind, payload, ts} dict."""
+
+    def __init__(self, console: Console | None = None):
+        # console=None → tests (notices are events only). A console → the block/production path
+        # (no streamed tape, but engine notices still reach the user; run() presents at the end).
+        self.events: list[dict] = []
+        self.console = console
+
+    def round_start(self, round_no: int) -> None:
+        self.events.append({"kind": "round_start", "round": round_no})
+
+    def live_context(self):
+        return nullcontext()
+
+    def handle(self, ev: dict) -> None:
+        self.events.append(ev)
+
+    def notice(self, text: str) -> None:
+        self.events.append({"kind": "notice", "text": text})
+        if self.console is not None:
+            self.console.print(text)
+
+    def tick(self) -> None:
+        pass
+
+    def finish(self) -> None:
+        pass
+
+    def kinds(self, head: str | None = None) -> list[str]:
+        """The event kinds seen (optionally for one head) — the shape most engine tests assert."""
+        return [e["kind"] for e in self.events
+                if head is None or e.get("head") == head]
+
+
+class TapeRenderer:
+    """Paints the live interleaved tape (docker-compose-logs, not panes — decision 10 Jul). A
+    SUBSCRIBER to the engine's event stream: ALL terminal painting for a duel lives here, none in
+    the run loop. Thinking/tool/retry lines print dim as they land and interleave freely; ANSWER
+    prose commits WHOLE in finish order. A transient Rich Live line tracks per-head phase/secs/$."""
+
+    def __init__(self, cfg: Config, console: Console, live: bool = True):
+        self.cfg, self.console, self.live = cfg, console, live
+        self.round_no = 0
+        self.phase = {"claude": "working", "codex": "working"}
+        self.spent = {"claude": "", "codex": ""}
+        self.done: set[str] = set()
+        self.open_run: str | None = None
+        self.t0 = time.monotonic()
+        self._disp = None
+
+    def round_start(self, round_no: int) -> None:
+        self.round_no = round_no
+        self.phase = {"claude": "working", "codex": "working"}
+        self.spent = {"claude": "", "codex": ""}   # per-round, like the old fan-out's call-local dict
+        self.done = set()
+        self.t0 = time.monotonic()
+        if round_no:            # critique rounds open with an honestly-labelled rule
+            self.console.rule(f"[dim]round {round_no} — {self.cfg.codex_glyph} and "
+                              f"{self.cfg.claude_glyph} challenge each other[/]",
+                              style="dim", align="left")
+
+    def _status(self) -> str:
+        spin = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
+        parts = []
+        for head in ("claude", "codex"):
+            color, _ = _HEAD_STYLE[head]
+            state = "✓" if head in self.done else f"{spin} {self.phase[head]}"
+            parts.append(f"[{color}]{_glyph(self.cfg, head)}[/] {state}{self.spent[head]}")
+        return f"{'    '.join(parts)}    [dim]{time.monotonic() - self.t0:.0f}s · ^C cancels[/]"
+
+    def live_context(self):
+        # live=False = the composer owns the bottom of the screen (Live + patch_stdout fight over
+        # the tty): events still print as they land, just no Rich Live status line.
+        self._disp = (Live(self._status(), console=self.console, refresh_per_second=8,
+                           transient=True) if self.live else None)
+        return self._disp or nullcontext()
+
+    def tick(self) -> None:
+        if self._disp:
+            self._disp.update(self._status())
+
+    def _close_box(self) -> None:
+        if self.open_run is None:
+            return
+        c, _ = _HEAD_STYLE.get(self.open_run, ("white", self.open_run))
+        self.console.print(f"[dim {c}]╰─[/]")
+        self.open_run = None
+
+    def _box_line(self, head: str, text: str) -> None:
+        c, name_ = _HEAD_STYLE.get(head, ("white", head))
+        if self.open_run != head:
+            self._close_box()
+            self.console.print(f"[dim {c}]╭─[/] [{c}]{_glyph(self.cfg, head)} {name_}[/]")
+            self.open_run = head
+        for ln in text.splitlines() or [""]:
+            self.console.print(f"[dim {c}]│[/] [dim]{ln}[/dim]")
+
+    def finish(self) -> None:
+        self._close_box()
+
+    def notice(self, text: str) -> None:
+        """An engine status line (dead head, router skip, syco flag…) — painted between rounds
+        when no box is open, so it never lands inside the dim scratch border."""
+        self._close_box()
+        self.console.print(text)
+
+    def handle(self, ev: dict) -> None:
+        cfg, console = self.cfg, self.console
+        head, kind, payload = ev["head"], ev["kind"], ev["payload"]
+        color, name = _HEAD_STYLE.get(head, ("white", head))
+        g = _glyph(cfg, head)
+        if kind == "_done":
+            self.done.add(head)
+            if self.open_run == head:       # a head that dies mid-run leaves no open box
+                self._close_box()
+        elif kind == "text":
+            self.phase[head] = "writing"    # prose buffers; commits on final
+        elif kind == "thinking":
+            self.phase[head] = "thinking"
+            if not cfg.tape_verbose:         # Ctrl+T / /tape flips it live; honored per event
+                pass
+            elif isinstance(payload, dict) and payload.get("text"):
+                self._box_line(head, escape(payload["text"].strip()))
+            elif isinstance(payload, dict) and payload.get("tokens"):
+                self._box_line(head, f"thought for {payload['tokens']} tokens "
+                                     "(trace hidden headless)")
+        elif kind == "tool":
+            self.phase[head] = "researching"
+            if cfg.tape_verbose:
+                self._box_line(head, f"🔍 {payload.get('name', '?')}"
+                                     f"({str(payload.get('input', ''))[:80]})")
+        elif kind == "retry":
+            if cfg.tape_verbose:
+                self._box_line(head, f"↻ retrying (attempt {payload.get('attempt')})"
+                                     f" — {payload.get('error', '')}")
+        elif kind == "cost":
+            if isinstance(payload, dict) and payload.get("usd") is not None:
+                self.spent[head] = f" ~${payload['usd']:.2f}"
+        elif kind == "final":
+            self._render_final(head, str(payload), color, name, g)
+        elif kind == "error":
+            if not (isinstance(payload, dict) and payload.get("cancelled")):
+                self._close_box()
+                console.print(f"[red]{g} {head} unavailable — "
+                              f"{str((payload or {}).get('error', '?'))[:120]}[/red]")
+
+    def _render_final(self, head, raw, color, name, g) -> None:
+        cfg, console, round_no = self.cfg, self.console, self.round_no
+        fbody, ftrailer = contract_tpl.split_trailer(raw)
+        fsecs = contract_tpl.sections(fbody) if cfg.contract else {}
+        if fsecs.get("answer"):
+            delib = fsecs.get("deliberation")           # DELIBERATION → the thinking register
+            if delib and cfg.tape_verbose:
+                self._box_line(head, f"{name} deliberates:")
+                self._box_line(head, escape(delib))
+            self._close_box()
+            for ln in (fsecs.get("claims") or "").splitlines():   # CLAIMS dim (literal [id])
+                if ln.strip():
+                    console.print(f"[dim]  {escape(ln)}[/]")
+            conf = contract_tpl.confidence(contract_tpl.parse_trailer(ftrailer, round_no))
+            _answer_rule(console, color, g, name, round_no, conf)
+            console.print(fsecs["answer"])
+        else:                                            # LEGACY (contract off / free-form)
+            crit, ans = _split_verdict(raw) if round_no else ("", raw)
+            if crit:
+                self._box_line(head, f"{name} challenges:")
+                self._box_line(head, crit)
+            self._close_box()
+            _answer_rule(console, color, g, name, round_no)
+            console.print(ans)
+
+
+def _run_round(msg_a, msg_b, *, cfg, sessions, depth, con_a, con_b, renderer):
+    """The ONE fan-out (step 5): both heads' streaming backends run concurrently into a queue;
+    every event updates flight telemetry and is handed to the renderer; the finals come back. No
+    painting here — renderers are guests. ^C lands in the MAIN thread (this loop) while the heads
+    run in workers: kill the subprocesses FIRST (their reads unblock, each worker yields an error
+    and a _done), let the renderer close out, THEN re-raise."""
     depth = depth or {}
-    pa = partial(proposer, session=sessions,
-                 thinking=depth.get("thinking", 0), tools=depth.get("tools", False), contract=con_a)
-    pb = partial(adversary, session=sessions,
-                 effort=depth.get("effort"), tools=depth.get("tools", False), contract=con_b)
-    flight.begin("claude", "thinking")       # coarse: subprocesses give no events until done,
-    flight.begin("codex", "thinking")        # so idle == elapsed here (matches _run's wall clock)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    q: queue.Queue = queue.Queue()
+    streams = {
+        "claude": partial(proposer_stream, session=sessions, thinking=depth.get("thinking", 0),
+                          tools=depth.get("tools", False), contract=con_a),
+        "codex": partial(adversary_stream, session=sessions, effort=depth.get("effort"),
+                         tools=depth.get("tools", False), contract=con_b),
+    }
+
+    def worker(label, fn, msg):
         try:
-            fa = pool.submit(_safe, pa, msg_a, cfg, "claude", sessions)
-            fb = pool.submit(_safe, pb, msg_b, cfg, "codex", sessions)
-            if live:
-                with Live(_status(fa, fb, cfg), console=console, refresh_per_second=8) as disp:
-                    while not (fa.done() and fb.done()):
-                        wait([fa, fb], timeout=0.15)
-                        _flight_futures(fa, fb)
-                        disp.update(_status(fa, fb, cfg))
-            else:                            # composer owns the screen: no Live, just wait
-                while not (fa.done() and fb.done()):
-                    wait([fa, fb], timeout=0.15)
-                    _flight_futures(fa, fb)
-        except KeyboardInterrupt:
-            kill_inflight()
-            raise
-        return fa.result(), fb.result()
+            for ev in _safe_stream(fn, msg, cfg, label, sessions):
+                q.put(ev)
+        finally:
+            q.put({"head": label, "kind": "_done", "payload": None, "ts": time.time()})
 
-
-def _flight_futures(fa, fb) -> None:
-    if fa.done():
-        flight.done("claude")
-    if fb.done():
-        flight.done("codex")
+    threads = [threading.Thread(target=worker, args=("claude", streams["claude"], msg_a), daemon=True),
+               threading.Thread(target=worker, args=("codex", streams["codex"], msg_b), daemon=True)]
+    finals: dict[str, str] = {}
+    done: set[str] = set()
+    flight.begin("claude")
+    flight.begin("codex")
+    for t in threads:
+        t.start()
+    try:
+        with renderer.live_context():
+            while len(done) < 2:
+                try:
+                    ev = q.get(timeout=0.15)
+                except queue.Empty:
+                    renderer.tick()
+                    continue
+                head, kind, payload = ev["head"], ev["kind"], ev["payload"]
+                flight.beat(head)                        # every event = proof of life
+                if kind == "_done":
+                    done.add(head)
+                    flight.done(head)
+                elif kind == "final":
+                    finals[head] = str(payload)          # engine keeps the text; renderer paints it
+                elif kind == "error":
+                    p = payload or {}
+                    finals[head] = (f"_({head} cancelled)_" if p.get("cancelled")
+                                    else f"_({head} unavailable: {p.get('error', '?')})_")
+                elif kind == "text":
+                    flight.phase(head, "writing")
+                elif kind == "thinking":
+                    flight.phase(head, "thinking")
+                elif kind == "tool":
+                    flight.phase(head, "researching")
+                elif kind == "cost" and isinstance(payload, dict) and payload.get("usd") is not None:
+                    flight.cost(head, float(payload["usd"]))
+                renderer.handle(ev)
+                renderer.tick()
+    except KeyboardInterrupt:
+        kill_inflight()                     # workers unblock, _safe_stream yields error, _done lands
+        renderer.finish()
+        for t in threads:
+            t.join(timeout=5)
+        raise
+    renderer.finish()
+    for t in threads:
+        t.join()
+    return (finals.get("claude") or "_(claude unavailable: empty stream)_",
+            finals.get("codex") or "_(codex unavailable: empty stream)_")
 
 
 def _safe(fn, msg, cfg, label, sessions=None):
@@ -394,173 +603,6 @@ def _glyph(cfg, head):
     return cfg.claude_glyph if head == "claude" else cfg.codex_glyph
 
 
-def _stream_both(msg_a, msg_b, cfg, console, sessions=None, depth=None, round_no=0, live=True,
-                 con_a="", con_b=""):
-    """The tape (step 5): both heads stream CONCURRENTLY into ONE scroll column —
-    docker-compose-logs, not side-by-side panes (decision 10 Jul). Thinking/tool/retry
-    lines print dim the moment they happen and interleave freely; ANSWER prose buffers
-    per head and commits WHOLE in finish order (prose never interleaves). A Rich Live
-    line at the bottom tracks per-head phase + seconds + $. Critique rounds open with an
-    honestly-labelled rule (⬡ challenges ✳) — the debate reads as the system's thinking,
-    never disguised as claude's own. ^C: kill the heads, drain the workers, re-raise —
-    same contract as _both."""
-    depth = depth or {}
-    q: queue.Queue = queue.Queue()
-    streams = {
-        "claude": partial(proposer_stream, session=sessions, thinking=depth.get("thinking", 0),
-                          tools=depth.get("tools", False), contract=con_a),
-        "codex": partial(adversary_stream, session=sessions, effort=depth.get("effort"),
-                         tools=depth.get("tools", False), contract=con_b),
-    }
-    def worker(label, fn, msg):
-        try:
-            for ev in _safe_stream(fn, msg, cfg, label, sessions):
-                q.put(ev)
-        finally:
-            q.put({"head": label, "kind": "_done", "payload": None, "ts": time.time()})
-    threads = [threading.Thread(target=worker, args=("claude", streams["claude"], msg_a), daemon=True),
-               threading.Thread(target=worker, args=("codex", streams["codex"], msg_b), daemon=True)]
-    if round_no:
-        console.rule(f"[dim]round {round_no} — {cfg.codex_glyph} and {cfg.claude_glyph} "
-                     f"challenge each other[/]", style="dim", align="left")
-    t0 = time.monotonic()
-    finals: dict[str, str] = {}
-    phase = {"claude": "working", "codex": "working"}
-    spent = {"claude": "", "codex": ""}
-    done: set[str] = set()
-    flight.begin("claude")                   # the flight panel mirrors phase/spent below —
-    flight.begin("codex")                    # same facts, rendered by the composer status line
-    for t in threads:
-        t.start()
-    def status():
-        spin = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
-        parts = []
-        for head in ("claude", "codex"):
-            color, _ = _HEAD_STYLE[head]
-            state = "✓" if head in done else f"{spin} {phase[head]}"
-            parts.append(f"[{color}]{_glyph(cfg, head)}[/] {state}{spent[head]}")
-        return f"{'    '.join(parts)}    [dim]{time.monotonic() - t0:.0f}s · ^C cancels[/]"
-    # live=False = the composer owns the bottom of the screen (step 7): events still print
-    # as they land, but no Rich Live status line (Live + patch_stdout fight over the tty).
-    disp = Live(status(), console=console, refresh_per_second=8, transient=True) if live else None
-    update = (lambda: disp.update(status())) if disp else (lambda: None)
-    # Run-grouped boxes (QoL, 11 Jul): consecutive scratch events from ONE head stream
-    # inside a colored border, closed the moment the OTHER head interrupts (or its answer
-    # lands). Scrollback can't be edited after the fact, so the box is drawn LIVE —
-    # header when a run opens, │-edged lines while it lasts, footer when it ends.
-    open_run: list[str | None] = [None]
-
-    def close_box() -> None:
-        if open_run[0] is None:
-            return
-        c, _ = _HEAD_STYLE.get(open_run[0], ("white", open_run[0]))
-        console.print(f"[dim {c}]╰─[/]")
-        open_run[0] = None
-
-    def box_line(head: str, text: str) -> None:
-        c, name_ = _HEAD_STYLE.get(head, ("white", head))
-        if open_run[0] != head:
-            close_box()
-            console.print(f"[dim {c}]╭─[/] [{c}]{_glyph(cfg, head)} {name_}[/]")
-            open_run[0] = head
-        for ln in text.splitlines() or [""]:
-            console.print(f"[dim {c}]│[/] [dim]{ln}[/dim]")
-    try:
-        with disp or nullcontext():
-            while len(done) < 2:
-                try:
-                    ev = q.get(timeout=0.15)
-                except queue.Empty:
-                    update()
-                    continue
-                head, kind, payload = ev["head"], ev["kind"], ev["payload"]
-                color, name = _HEAD_STYLE.get(head, ("white", head))
-                g = _glyph(cfg, head)
-                flight.beat(head)                               # every event = proof of life
-                if kind == "_done":
-                    done.add(head)
-                    flight.done(head)
-                    if open_run[0] == head:  # a head that dies mid-run leaves no open box
-                        close_box()
-                elif kind == "text":
-                    phase[head] = "writing"                     # prose buffers; commits on final
-                    flight.phase(head, "writing")
-                elif kind == "thinking":
-                    phase[head] = "thinking"
-                    flight.phase(head, "thinking")
-                    # cfg.tape_verbose re-read PER EVENT: Ctrl+T / /tape flips it mid-turn
-                    # and the pump honors it immediately (hides the text, never the phase).
-                    if not cfg.tape_verbose:
-                        pass
-                    elif isinstance(payload, dict) and payload.get("text"):
-                        box_line(head, payload["text"].strip())
-                    elif isinstance(payload, dict) and payload.get("tokens"):
-                        box_line(head, f"thought for {payload['tokens']} tokens "
-                                       "(trace hidden headless)")
-                elif kind == "tool":
-                    phase[head] = "researching"
-                    flight.phase(head, "researching")
-                    if cfg.tape_verbose:
-                        box_line(head, f"🔍 {payload.get('name', '?')}"
-                                       f"({str(payload.get('input', ''))[:80]})")
-                elif kind == "retry":
-                    if cfg.tape_verbose:
-                        box_line(head, f"↻ retrying (attempt {payload.get('attempt')})"
-                                       f" — {payload.get('error', '')}")
-                elif kind == "cost":
-                    if isinstance(payload, dict) and payload.get("usd") is not None:
-                        spent[head] = f" ~${payload['usd']:.2f}"
-                        flight.cost(head, float(payload["usd"]))
-                elif kind == "final":
-                    finals[head] = str(payload)          # raw back to run(), which re-splits
-                    fbody, ftrailer = contract_tpl.split_trailer(finals[head])
-                    fsecs = contract_tpl.sections(fbody) if cfg.contract else {}
-                    if fsecs.get("answer"):
-                        # CONTRACT render: DELIBERATION in the thinking register (the dim box),
-                        # CLAIMS dim, the standalone ANSWER as the deliverable with overall
-                        # confidence on its rule. (⚠ for an unparsed trailer rides the tape from
-                        # run()'s _contract_pass, which owns the authoritative post-retry verdict.)
-                        delib = fsecs.get("deliberation")
-                        if delib and cfg.tape_verbose:
-                            box_line(head, f"{name} deliberates:")
-                            box_line(head, escape(delib))    # model text: never parse as markup
-                        close_box()
-                        for ln in (fsecs.get("claims") or "").splitlines():
-                            if ln.strip():                   # CLAIMS are literally `[id] …` — escape
-                                console.print(f"[dim]  {escape(ln)}[/]")
-                        conf = contract_tpl.confidence(contract_tpl.parse_trailer(ftrailer, round_no))
-                        _answer_rule(console, color, g, name, round_no, conf)
-                        console.print(fsecs["answer"])
-                    else:                                # LEGACY (contract off / free-form)
-                        crit, ans = _split_verdict(finals[head]) if round_no else ("", finals[head])
-                        if crit:                         # scratch work: dim, honestly labelled
-                            box_line(head, f"{name} challenges:")
-                            box_line(head, crit)
-                        close_box()                      # answers stand OUTSIDE the scratch box
-                        _answer_rule(console, color, g, name, round_no)
-                        console.print(ans)
-                elif kind == "error":
-                    if isinstance(payload, dict) and payload.get("cancelled"):
-                        finals[head] = f"_({head} cancelled)_"
-                    else:
-                        err = (payload or {}).get("error", "?")
-                        finals[head] = f"_({head} unavailable: {err})_"
-                        close_box()
-                        console.print(f"[red]{g} {head} unavailable — {str(err)[:120]}[/red]")
-                update()
-    except KeyboardInterrupt:
-        kill_inflight()                     # workers unblock, _safe_stream yields error, _done lands
-        close_box()
-        for t in threads:
-            t.join(timeout=5)
-        raise
-    close_box()
-    for t in threads:
-        t.join()
-    return (finals.get("claude") or "_(claude unavailable: empty stream)_",
-            finals.get("codex") or "_(codex unavailable: empty stream)_")
-
-
 def _safe_stream(fn, msg, cfg, label, sessions=None):
     """_safe's contract for the streaming pump (step 4): flight-recorder head_call rows,
     transient retries, quarantine postmortems — event-shaped. A retry restarts the stream
@@ -608,12 +650,14 @@ def _moved(prev, now):  # 0=identical, 1=rewritten. Crude on purpose; never fire
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"   # wall-clock indexed so redraws from other sources don't jitter it
 
-
-def _status(fa, fb, cfg):
-    spin = _SPINNER[int(time.monotonic() * 10) % len(_SPINNER)]
-    mark = lambda f: "✓" if f.done() else f"{spin} thinking"
-    return (f"[orange1]{cfg.claude_glyph}[/] claude {mark(fa)}    "
-            f"[blue]{cfg.codex_glyph}[/] codex {mark(fb)}    [dim]^C cancels[/]")
+def present_columns(console, cells: list[str]) -> None:
+    """The ONE side-by-side grid — shared by the duel present and shadow's arm compare (step 5
+    dedup). The caller owns the wide/narrow gate; this just lays out the cells it is handed."""
+    grid = Table.grid(padding=(0, 2))
+    for _ in cells:
+        grid.add_column()
+    grid.add_row(*cells)
+    console.print(grid)
 
 
 def _present(console, a, b, cfg):
@@ -626,11 +670,7 @@ def _present(console, a, b, cfg):
     a, b = contract_tpl.answer_of(a), contract_tpl.answer_of(b)
     ga, gb = cfg.claude_glyph, cfg.codex_glyph
     if console.width >= 110:
-        cols = Table.grid(padding=(0, 2))
-        cols.add_column()
-        cols.add_column()
-        cols.add_row(f"[orange1]## {ga} Claude[/]\n{a}", f"[blue]## {gb} Codex[/]\n{b}")
-        console.print(cols)
+        present_columns(console, [f"[orange1]## {ga} Claude[/]\n{a}", f"[blue]## {gb} Codex[/]\n{b}"])
     else:
         console.rule(f"[orange1]{ga} Claude[/]", style="orange1", align="left")
         console.print(a)
@@ -692,72 +732,12 @@ class DebateRenderer:   # the G1 seam: REPLACES chat.py's _DebateRendererSketch
         s = self.sessions
         return s is None or (s.claude is None and s.codex is None)
 
-    def prepare_briefing(self, question: str) -> None:
-        """The briefing popup (11 Jul): on the FIRST armed message of a conversation with
-        history, claude drafts what codex needs to know; the human confirms A (the draft,
-        default) / B (last turns) / C (full transcript) or types their own. MAIN-thread
-        only, BETWEEN composer reads — console.input is safe there. Non-interactive
-        callers skip this entirely (auto-B: the default preamble). An empty chat has
-        nothing to brief — no popup, straight to the duel."""
-        if not (self.adversarial and self.cfg.head_sessions
-                and (self.sessions is None or self._fresh())):
-            return
-        pre = preamble.preamble(self.cfg)
-        if not pre:
-            return
-        draft_prompt = (f"{pre}A second AI voice is about to join this conversation to debate "
-                        "the next question. Write a compact briefing (under 250 words) telling "
-                        "it what it needs to know: the topic, key facts and decisions so far, "
-                        "and any user constraints. Do NOT answer the question itself.\n\n"
-                        f"Next question:\n{question}")
-        with self.console.status(f"[dim]{self.cfg.claude_glyph} drafting a briefing for "
-                                 f"{self.cfg.codex_glyph}…[/]", spinner="dots"):
-            draft = _safe(partial(proposer, thinking=0, tools=False),
-                          draft_prompt, self.cfg, "claude")
-        self.console.rule(f"[dim]briefing {self.cfg.codex_glyph} codex will receive[/]",
-                          style="dim", align="left")
-        self.console.print(f"[dim]{draft}[/dim]")
-        picked = self._pick_briefing()               # arrow-key picker on a TTY (11 Jul ask)
-        if picked == "custom":
-            choice = self.console.input("[bold]your briefing ›[/] ").strip()   # "" falls
-            low = choice.lower()                     # through to A below, same as classic
-        elif picked is not None:
-            choice = low = picked
-        else:                                        # no TTY / no pt: the classic typed path
-            self.console.print("[bold]A[/] send this briefing (recommended) · [bold]B[/] send "
-                               f"the last {self.cfg.history_turns} turns · [bold]C[/] send the "
-                               "full transcript · or type your own")
-            choice = self.console.input("[bold]briefing ›[/] ").strip()
-            low = choice.lower()
-        if low in ("", "a"):
-            self.briefing_seed = ("Briefing on the conversation so far (written by the other "
-                                  f"voice, confirmed by the user):\n{draft}\n\n")
-        elif low == "b":
-            self.briefing_seed = None                        # the default preamble
-        elif low == "c":
-            _, turns = preamble.turns()
-            self.briefing_seed = ("Full transcript of the conversation so far:\n"
-                                  + "\n\n".join(turns) + "\n\n---\n\n")
-        else:                                                # free text = the user's own briefing
-            self.briefing_seed = f"Briefing from the user:\n{choice}\n\n"
-        record(briefing(low if low in ("", "a", "b", "c") else "custom",
-                        text=(self.briefing_seed or "")[:2000]))
-
-    def _pick_briefing(self) -> str | None:
-        """Seam for tests/headless: returns 'a'/'b'/'c'/'custom' via the arrow picker,
-        or None when there's no TTY/pt — the caller falls back to typed input."""
-        if not sys.stdin.isatty():
-            return None
-        try:
-            from .composer import show_picker
-        except ImportError:
-            return None
-        options = [("A", "send this briefing (recommended)"),
-                   ("B", f"send the last {self.cfg.history_turns} turns"),
-                   ("C", "send the full transcript"),
-                   ("D", "type your own briefing")]
-        got = show_picker(options, accent=self.cfg.accent_color, title="briefing ›")
-        return {0: "a", 1: "b", 2: "c", 3: "custom", None: "a"}[got]   # Esc/^C = default A
+    def needs_briefing(self) -> bool:
+        """Whether a fresh briefing applies this turn: an armed duel with head-session memory
+        whose sessions haven't been briefed yet. The REPL's briefing popup asks this instead of
+        reaching into private state — the renderer owns the answer."""
+        return bool(self.adversarial and self.cfg.head_sessions
+                    and (self.sessions is None or self._fresh()))
 
     def handle(self, user_input: str) -> None:
         user_input = preamble.notes() + user_input          # /note facts ride EVERY next message

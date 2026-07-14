@@ -1,7 +1,7 @@
 """council/flight.py — shared per-head liveness state: the flight panel (backlog 6+9).
 
-Writers: the streaming pump in debate.py (event-grained) and the blocking paths
-(_both / solo / judge — coarse: one begin, one done). Reader: chat.py's composer
+Writers: the duel fan-out in debate.py (_run_round, event-grained) and the coarse paths
+(solo / judge — one begin, one done). Reader: chat.py's composer
 status line on its 0.5s tick. Module-level dict + lock is honest here: chat.py
 enforces ONE turn in flight per process, so there is exactly one panel to describe.
 
