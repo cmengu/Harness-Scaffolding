@@ -74,11 +74,12 @@ You are the judge of a duel. Read both answers blind and emit ONLY a JSON traile
  "digest": "<one-paragraph synthesis>", "confidence": <0-1>}"""
 
 
-def injection(round_no: int, *, opponent_confidence: float | None = None,
-              judge: bool = False, final_round: bool = False) -> str:
+def injection(round_no: int, *, judge: bool = False, final_round: bool = False) -> str:
     """The contract text for one armed call. round 0 = opening shape (no deliberation, no
-    stances, ARTIFACT none); round N = the critique shape with the prompt pack and, when known,
-    the opponent's stated confidence so the debate prices in how sure the other side is."""
+    stances, ARTIFACT none); round N = the critique shape with the prompt pack. The template is
+    STATIC instructions only — the opponent's stated confidence is a dynamic per-turn fact, so it
+    rides the round-N message (debate._opp_conf), not here; the prompt pack already carries the
+    anti-deference rule that tells a head how to weigh it."""
     if judge:
         return _JUDGE
     head = ("You are one of two voices in a council duel. Answer in the sections below, IN ORDER, "
@@ -86,11 +87,8 @@ def injection(round_no: int, *, opponent_confidence: float | None = None,
             "machine-authoritative copy: if prose and trailer ever disagree, the trailer wins.")
     if round_no <= 0:
         return f"{head}\n\n{_SECTIONS_ROUND0}"
-    conf = ("" if opponent_confidence is None
-            else f"\n\nThe other voice stated confidence {opponent_confidence:.2f} in its position — "
-                 "weigh that, do not simply defer to it.")
-    tail = "" if final_round else ("\n\nThis is not the final round: keep ARTIFACT as `none`.")
-    return f"{head}\n\n{_PROMPT_PACK}{conf}\n\n{_SECTIONS_ROUNDN}{tail}"
+    tail = "" if final_round else "\n\nThis is not the final round: keep ARTIFACT as `none`."
+    return f"{head}\n\n{_PROMPT_PACK}\n\n{_SECTIONS_ROUNDN}{tail}"
 
 
 # ── trailer slicing + validation ─────────────────────────────────────────────────────────
@@ -165,30 +163,28 @@ def confidence(parsed: dict | None) -> float | None:
 # ── the retry schema (native flag: claude --json-schema <inline> · codex --output-schema <file>) ──
 def schema_json(round_no: int) -> str:
     """The JSON Schema string the corrective retry attaches so its whole output is
-    shape-guaranteed. One permissive superset serves both variants (round 0 simply omits the
-    optional arrays); position + confidence are the required core."""
-    schema = {
-        "type": "object",
-        "required": ["position", "confidence"],
-        "properties": {
-            "position": {"type": "string", "maxLength": 300},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-            "claims": {"type": "array", "items": {"type": "object",
-                "required": ["id"],
-                "properties": {"id": {"type": "string"},
-                               "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                               "falsified_by": {"type": "string"}}}},
-            "stances": {"type": "array", "items": {"type": "object",
-                "required": ["on", "stance"],
-                "properties": {"on": {"type": "string"},
-                               "stance": {"enum": ["SUPPORT", "REFUTE", "UNCERTAIN"]},
-                               "evidence": {"type": "string"}}}},
-            "concessions": {"type": "array", "items": {"type": "object",
-                "required": ["adopted"],
-                "properties": {"adopted": {"type": "string"}, "evidence": {"type": "string"}}}},
-        },
+    shape-guaranteed. Two variants, as the contract spec states: round 0 has no stances or
+    concessions; round N adds them. position + confidence are the required core in both."""
+    props = {
+        "position": {"type": "string", "maxLength": 300},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "claims": {"type": "array", "items": {"type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "string"},
+                           "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                           "falsified_by": {"type": "string"}}}},
     }
-    return json.dumps(schema)
+    if round_no > 0:
+        props["stances"] = {"type": "array", "items": {"type": "object",
+            "required": ["on", "stance"],
+            "properties": {"on": {"type": "string"},
+                           "stance": {"enum": ["SUPPORT", "REFUTE", "UNCERTAIN"]},
+                           "evidence": {"type": "string"}}}}
+        props["concessions"] = {"type": "array", "items": {"type": "object",
+            "required": ["adopted"],
+            "properties": {"adopted": {"type": "string"}, "evidence": {"type": "string"}}}}
+    return json.dumps({"type": "object", "required": ["position", "confidence"],
+                       "properties": props})
 
 
 @contextlib.contextmanager
