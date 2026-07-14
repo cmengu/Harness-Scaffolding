@@ -531,8 +531,10 @@ def _last(cfg: Config, console: Console) -> None:
     if last.get("adversary"):
         from .debate import _present
         _present(console, str(last.get("proposer", "")), str(last["adversary"]), cfg)
-    else:
-        console.print(f"[orange1]## {cfg.claude_glyph} Claude[/]\n{last.get('proposer', '')}")
+    else:                                                # deliverable excerpt: ANSWER only
+        from .contract import answer_of
+        console.print(f"[orange1]## {cfg.claude_glyph} Claude[/]\n"
+                      f"{answer_of(str(last.get('proposer', '')))}")
     judges = trace(run_id=RUN_ID, role="judge")
     if judges and judges[-1].get("ts", 0) > last.get("ts", 0):
         console.print(f"\n[bold]## ⚖ Synthesis[/] ({judges[-1].get('style')})\n{judges[-1].get('text', '')}")

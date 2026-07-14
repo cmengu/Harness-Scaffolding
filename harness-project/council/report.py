@@ -83,8 +83,10 @@ def render_rows(rows: list[dict], console: Console) -> None:
         elif is_answer(r):
             if r.get("adversary"):
                 _present(console, str(r.get("proposer", "")), str(r["adversary"]), cfg)
-            else:
-                console.print(f"[orange1]## {cfg.claude_glyph} Claude[/]\n{r.get('proposer', '')}")
+            else:                                        # single-voiced: still a deliverable view,
+                from .contract import answer_of          # so strip a contract answer to its ANSWER
+                console.print(f"[orange1]## {cfg.claude_glyph} Claude[/]\n"
+                              f"{answer_of(str(r.get('proposer', '')))}")
         elif is_judge(r):
             console.print(f"\n[bold]## ⚖ Synthesis[/] ({r.get('style')})\n{r.get('text', '')}")
         elif is_code_assistant(r):
