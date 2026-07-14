@@ -28,18 +28,15 @@ def test_split_verdict_contract():
 def test_round_one_splits_critique_from_answer(monkeypatch):
     monkeypatch.setenv("COUNCIL_STUB_TEXT",
                        "your sources are stale ===ANSWER=== The moon is basalt.")
-    console, buf = taped()
-    result = debate.run("moon?", rounds=1, judge=None, cfg=load_config(), console=console)
+    # engine flow: assert the recorded rows, not printed text (the tape painting of the split is
+    # a renderer concern — test_tape.test_tape_paints_the_critique_split).
+    result = debate.run("moon?", rounds=1, judge=None, cfg=load_config(), console=Console(quiet=True))
     assert result.proposer_final == "The moon is basalt."   # deliverable = standalone answer
     assert "===ANSWER===" not in result.proposer_final
     row = [r for r in trace(role="debate") if r.get("round") == 1][0]
     assert row["proposer"] == "The moon is basalt."
     assert row["proposer_critique"] == "your sources are stale"
     assert row["adversary_critique"] == "your sources are stale"
-    out = buf.getvalue()
-    assert "challenges:" in out                            # honest dim label on the tape
-    assert "your sources are stale" in out                 # the scratch work was shown…
-    assert "The moon is basalt." in out                    # …and the clean answer committed
 
 
 def test_critique_instruction_reaches_the_heads(tmp_path, monkeypatch):

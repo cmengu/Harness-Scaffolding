@@ -110,12 +110,11 @@ def test_half_minted_pair_reseeds_only_the_dead_head(monkeypatch):
     monkeypatch.setenv("COUNCIL_STREAM_TAPE", "false")
     calls = []
 
-    def fake_both(msg_a, msg_b, cfg, console, sessions=None, depth=None,
-                  round_no=0, live=True, con_a="", con_b=""):
+    def fake_fan(msg_a, msg_b, *, cfg, sessions=None, depth=None, con_a="", con_b="", renderer=None):
         calls.append((msg_a, msg_b))
         return "A-ans", "B-ans"
 
-    monkeypatch.setattr(debate, "_both", fake_both)
+    monkeypatch.setattr(debate, "_run_round", fake_fan)
     s = HeadSessions(codex="stub-thread-1")               # post-failure: claude unminted
     debate.run("the question", rounds=0, judge=None, cfg=load_config(),
                console=quiet(), sessions=s, seed="SEEDMARK\n\n")

@@ -23,10 +23,11 @@ def test_dead_round_zero_aborts_debate(monkeypatch):
     monkeypatch.setenv("COUNCIL_CLAUDE_COMMAND", str(STUBS / "claude-bad-flag"))
     monkeypatch.setenv("COUNCIL_CODEX_COMMAND", str(STUBS / "claude-bad-flag"))
     monkeypatch.setenv("COUNCIL_HEAD_RETRIES", "0")
-    console, buf = taped()
-    result = debate.run("q", rounds=2, judge="reasoning", cfg=load_config(), console=console)
+    r = debate.QuietRenderer()                             # engine test: assert events, not paint
+    result = debate.run("q", rounds=2, judge="reasoning", cfg=load_config(),
+                        console=Console(quiet=True), renderer=r)
     assert result.escalated is True                        # both dead = loudly failed
-    assert "turn abandoned" in buf.getvalue()
+    assert any("turn abandoned" in e.get("text", "") for e in r.events)   # emitted as a notice
     rows = [r for r in trace(role="debate") if r.get("round") is not None and "proposer" in r]
     assert {r["round"] for r in rows} == {0}               # NO critique of corpses
     assert trace(role="debate", event="round0_failed")[0]["dead"] == ["claude", "codex"]
@@ -36,11 +37,12 @@ def test_dead_round_zero_aborts_debate(monkeypatch):
 def test_one_dead_head_goes_single_voiced_without_rounds(monkeypatch):
     monkeypatch.setenv("COUNCIL_CODEX_COMMAND", str(STUBS / "claude-bad-flag"))
     monkeypatch.setenv("COUNCIL_HEAD_RETRIES", "0")
-    console, buf = taped()
-    result = debate.run("q", rounds=2, judge=None, cfg=load_config(), console=console)
+    r = debate.QuietRenderer()
+    result = debate.run("q", rounds=2, judge=None, cfg=load_config(),
+                        console=Console(quiet=True), renderer=r)
     assert result.escalated is False
     assert "STUB CLAUDE" in result.proposer_final          # the healthy answer survives
-    assert "single-voiced" in buf.getvalue()
+    assert any("single-voiced" in e.get("text", "") for e in r.events)
     rounds = {r["round"] for r in trace(role="debate") if r.get("round") is not None and "proposer" in r}
     assert rounds == {0}                                   # no debate against a corpse
 

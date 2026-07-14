@@ -5,7 +5,6 @@ ledger as shadow_arm rows under one run_id, so a comparison stays addressable fo
 from __future__ import annotations
 
 from rich.console import Console
-from rich.table import Table
 
 from .config import Config, Heads, _apply, load_config
 from .ledger import record, run_start_shadow, shadow_arm
@@ -40,7 +39,7 @@ def apply_overrides(cfg: Config, data: dict) -> Config:
 def run_shadow(prompt: str, overrides: tuple[str, ...], console: Console) -> None:
     """Run both arms (sequentially — a duel is already two subprocesses; four at once
     doubles the blast radius for no insight), record each, then present side by side."""
-    from .debate import run as debate_run   # lazy: keeps `council --help` fast
+    from .debate import run as debate_run, QuietRenderer   # lazy: keeps `council --help` fast
 
     data = parse_overrides(overrides)
     cfg_a = load_config()
@@ -51,7 +50,9 @@ def run_shadow(prompt: str, overrides: tuple[str, ...], console: Console) -> Non
     for arm, cfg, label in (("A", cfg_a, "current config"),
                             ("B", cfg_b, "+ " + " ".join(overrides) if overrides else "no overrides")):
         with console.status(f"[dim]arm {arm} ({label}) thinking…[/]", spinner="dots"):
-            r = debate_run(prompt, rounds=cfg.rounds, judge=cfg.judge_style, cfg=cfg, console=quiet)
+            # the shared engine renderer: arms subscribe quietly, the comparison IS the output
+            r = debate_run(prompt, rounds=cfg.rounds, judge=cfg.judge_style, cfg=cfg,
+                           console=quiet, renderer=QuietRenderer())
         answer = r.synthesis or r.proposer_final
         record(shadow_arm(arm, answer,
                           overrides=list(overrides) if arm == "B" else []))
@@ -60,15 +61,12 @@ def run_shadow(prompt: str, overrides: tuple[str, ...], console: Console) -> Non
 
 
 def _present_arms(console: Console, arms: list[tuple[str, str, str]]) -> None:
-    """Same width-adaptive stance as debate._present: columns only when each arm gets
-    readable prose width; narrow terminals get full-width blocks under rule headers."""
+    """Same width-adaptive stance as debate._present, via the SHARED column layout: columns only
+    when each arm gets readable prose width; narrow terminals get full-width blocks under rules."""
+    from .debate import present_columns
     if console.width >= 110:
-        cols = Table.grid(padding=(0, 2))
-        cols.add_column()
-        cols.add_column()
-        cols.add_row(*(f"[bold]## arm {arm}[/] [dim]({label})[/]\n{answer}"
-                       for arm, label, answer in arms))
-        console.print(cols)
+        present_columns(console, [f"[bold]## arm {arm}[/] [dim]({label})[/]\n{answer}"
+                                  for arm, label, answer in arms])
     else:
         for arm, label, answer in arms:
             console.rule(f"arm {arm} [dim]({label})[/]", align="left")

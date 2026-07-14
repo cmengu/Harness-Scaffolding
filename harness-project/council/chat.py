@@ -153,8 +153,8 @@ def run_loop(renderer: Renderer, cfg: Config, console: Console) -> None:
                     pending.append(text)
                     console.print(f"[dim]⧗ queued ({len(pending)}): {text[:60]}[/]")
                     continue
-                if interactive and hasattr(renderer, "prepare_briefing"):
-                    renderer.prepare_briefing(text)   # the popup runs BETWEEN reads, main thread
+                if interactive:
+                    prepare_briefing(renderer, text, console)   # REPL-owned popup, BETWEEN reads
                 if interactive:
                     turn[0] = threading.Thread(target=worker, args=(text,), daemon=True)
                     turn[0].start()
@@ -823,3 +823,75 @@ def _compact(cfg: Config, console: Console) -> None:
     start_session(summary=text)
     console.print(f"⧉ compacted — {len(turns)} turn(s) → {len(text)} chars of summary; "
                   f"[dim]the full transcript stays in the ledger (/switch lists it)[/]")
+
+
+# ── the briefing popup — a REPL concern (it lives with the other popups), moved off the duel
+#    renderer in the event-seam refactor (step 5). Run BETWEEN reads on the MAIN thread. ────────
+def prepare_briefing(renderer, question: str, console: Console) -> None:
+    """On the FIRST armed message of a conversation with history, claude drafts what codex needs
+    to know; the human confirms A (draft, default) / B (last turns) / C (transcript) or types
+    their own, and the choice becomes `renderer.briefing_seed` for the duel. A non-duel renderer,
+    solo mode, or an empty chat: no popup (auto-B, the default preamble)."""
+    from functools import partial
+    from .backends import proposer
+    from .debate import _safe
+    from .ledger import briefing
+    cfg = getattr(renderer, "cfg", None)
+    if not (hasattr(renderer, "briefing_seed") and getattr(renderer, "adversarial", False)
+            and cfg and cfg.head_sessions and (renderer.sessions is None or renderer._fresh())):
+        return
+    pre = preamble.preamble(cfg)
+    if not pre:
+        return
+    draft_prompt = (f"{pre}A second AI voice is about to join this conversation to debate "
+                    "the next question. Write a compact briefing (under 250 words) telling "
+                    "it what it needs to know: the topic, key facts and decisions so far, "
+                    "and any user constraints. Do NOT answer the question itself.\n\n"
+                    f"Next question:\n{question}")
+    with console.status(f"[dim]{cfg.claude_glyph} drafting a briefing for "
+                        f"{cfg.codex_glyph}…[/]", spinner="dots"):
+        draft = _safe(partial(proposer, thinking=0, tools=False), draft_prompt, cfg, "claude")
+    console.rule(f"[dim]briefing {cfg.codex_glyph} codex will receive[/]", style="dim", align="left")
+    console.print(f"[dim]{draft}[/dim]")
+    picked = _pick_briefing(cfg)                     # arrow-key picker on a TTY (11 Jul ask)
+    if picked == "custom":
+        choice = console.input("[bold]your briefing ›[/] ").strip()   # "" falls through to A
+        low = choice.lower()
+    elif picked is not None:
+        choice = low = picked
+    else:                                            # no TTY / no pt: the classic typed path
+        console.print("[bold]A[/] send this briefing (recommended) · [bold]B[/] send the last "
+                      f"{cfg.history_turns} turns · [bold]C[/] send the full transcript · "
+                      "or type your own")
+        choice = console.input("[bold]briefing ›[/] ").strip()
+        low = choice.lower()
+    if low in ("", "a"):
+        renderer.briefing_seed = ("Briefing on the conversation so far (written by the other "
+                                  f"voice, confirmed by the user):\n{draft}\n\n")
+    elif low == "b":
+        renderer.briefing_seed = None                # the default preamble
+    elif low == "c":
+        _, turns = preamble.turns()
+        renderer.briefing_seed = ("Full transcript of the conversation so far:\n"
+                                  + "\n\n".join(turns) + "\n\n---\n\n")
+    else:                                            # free text = the user's own briefing
+        renderer.briefing_seed = f"Briefing from the user:\n{choice}\n\n"
+    record(briefing(low if low in ("", "a", "b", "c") else "custom",
+                    text=(renderer.briefing_seed or "")[:2000]))
+
+
+def _pick_briefing(cfg: Config) -> str | None:
+    """Seam for tests/headless: 'a'/'b'/'c'/'custom' via the arrow picker, or None when there's
+    no TTY/pt so the caller falls back to typed input."""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        from .composer import show_picker
+    except ImportError:
+        return None
+    options = [("A", "send this briefing (recommended)"),
+               ("B", f"send the last {cfg.history_turns} turns"),
+               ("C", "send the full transcript"),
+               ("D", "type your own briefing")]
+    got = show_picker(options, accent=cfg.accent_color, title="briefing ›")
+    return {0: "a", 1: "b", 2: "c", 3: "custom", None: "a"}[got]   # Esc/^C = default A
